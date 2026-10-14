@@ -1,0 +1,61 @@
+market:
+  exchange: "binance"
+  symbol: "BTC/USDT"
+  timeframe: "4h"
+  since_days: 1825        # 5 anni di storico (~11.000 barre 4H)
+  taker_fee: 0.0005       # 0.05% taker fee per singolo trade (0.10% round-trip)
+
+features:
+  lookback_window: 64     # 64 barre 4H (~10.6 giorni di contesto storico)
+  sma_short: 50
+  sma_long: 200
+  atr_period: 14
+  volume_ma_period: 20
+  scaling_method: "robust" # "robust" (RobustScaler) o "standard" con clipping
+
+labeling:
+  prediction_horizon: 6   # 6 barre = 24 ore
+  profit_target_pct: 0.020 # +2.0% Take Profit
+  stop_loss_pct: 0.014    # -1.4% Stop Loss
+  use_atr_dynamic_barrier: false
+  atr_multiplier_target: 2.0
+  atr_multiplier_sl: 1.5
+  worst_case_conflict: true # Se TP e SL vengono toccati nella stessa barra, considera SL (conservativo)
+
+model:
+  kernel_size: 3
+  # 5 blocchi [1, 2, 4, 8, 16] con RF = 125 barre -> ~55k parametri (ideale per 7.5k campioni)
+  channels: [32, 32, 48, 48, 64]
+  dropout: 0.30           # Dropout incrementato a 0.30 anti-overfitting
+  use_layer_norm: true
+  num_classes: 3          # 0: Neutral, 1: Long, 2: Short
+
+training:
+  train_ratio: 0.70
+  val_ratio: 0.15
+  test_ratio: 0.15
+  embargo_bars: 12        # 12 barre = 48 ore di embargo anti-leakage
+  batch_size: 64
+  epochs: 60
+  learning_rate: 0.0003   # LR ridotto a 3e-4 per convergenza stabile
+  weight_decay: 0.01      # Weight decay potenziato a 0.01
+  early_stopping_patience: 12
+  seed: 42
+  device: "cuda"          # Fallback su "cpu" se cuda non disponibile
+
+decision:
+  long_prob_threshold: 0.38        # Calibrato su base rate 21%
+  short_prob_threshold: 0.38
+  directional_ratio_threshold: 1.25 # P(Long) > 1.25 * P(Short)
+  hard_take_profit_pct: 0.028      # +2.8%
+  hard_stop_loss_pct: 0.018        # -1.8%
+  max_holding_bars: 6              # 24 ore di holding period massimo
+
+execution:
+  mode: "realnet_paper"        # "realnet_paper" (mercato reale Binance senza soldi reali), "testnet", "live"
+  initial_paper_balance: 100.0 # Saldo virtuale di partenza (100 USDT)
+  circuit_breaker_min_balance: 50.0 # Stop automatico se il capitale tocca 50 USDT
+  compounding_allocation_pct: 0.95 # All-in 95% del saldo corrente a leva 1x
+  use_dynamic_atr_targets: true    # Usa le barriere vincenti dell'Exp 2 (2.2 ATR TP / 1.4 ATR SL)
+  atr_multiplier_target: 2.2
+  atr_multiplier_sl: 1.4

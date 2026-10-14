@@ -1,0 +1,430 @@
+import os
+import sys
+import time
+import json
+import logging
+import argparse
+from datetime import datetime, timezone
+from typing import Dict, Any, Optional
+
+# Assicura che la root del progetto sia in sys.path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+import numpy as np
+import pandas as pd
+import torch
+import ccxt
+
+from src.data_loader import load_config
+from src.features import extract_features, FeatureScaler, FEATURE_COLUMNS
+from src.model import TemporalConvolutionalNetwork
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
+
+LEDGER_PATH = "data/paper_trading_ledger.json"
+
+
+class PaperTradingLedger:
+    """Gestisce lo stato persistente delle posizioni e del bilancio simulato su file JSON."""
+    def __init__(self, initial_balance: float = 100.0, circuit_breaker_min: float = 50.0):
+        self.initial_balance = initial_balance
+        self.circuit_breaker_min = circuit_breaker_min
+        self.state = self.load()
+
+    def load(self) -> Dict[str, Any]:
+        os.makedirs(os.path.dirname(LEDGER_PATH), exist_ok=True)
+        if os.path.exists(LEDGER_PATH):
+            try:
+                with open(LEDGER_PATH, "r") as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.warning(f"Errore lettura ledger ({e}). Inizializzazione nuovo ledger.")
+        
+        default_state = {
+            "initial_balance": self.initial_balance,
+            "current_balance": self.initial_balance,
+            "circuit_breaker_triggered": False,
+            "current_position": None,
+            "closed_trades": [],
+            "total_pnl_usdt": 0.0,
+            "total_fees_usdt": 0.0,
+            "win_rate_pct": 0.0,
+            "last_update": datetime.now(timezone.utc).isoformat()
+        }
+        self.save(default_state)
+        return default_state
+
+    def save(self, state: Optional[Dict[str, Any]] = None):
+        if state is not None:
+            self.state = state
+        self.state["last_update"] = datetime.now(timezone.utc).isoformat()
+        with open(LEDGER_PATH, "w") as f:
+            json.dump(self.state, f, indent=2)
+
+    @property
+    def balance(self) -> float:
+        return self.state.get("current_balance", self.initial_balance)
+
+    @property
+    def position(self) -> Optional[Dict[str, Any]]:
+        return self.state.get("current_position")
+
+    def is_circuit_breaker_active(self) -> bool:
+        if self.balance < self.circuit_breaker_min:
+            self.state["circuit_breaker_triggered"] = True
+            self.save()
+            return True
+        return False
+
+
+class RealnetPaperAgent:
+    """
+    Agente di Paper Trading sul Mercato REALE (Realnet Binance Futures).
+    - Riceve i prezzi autentici e in tempo reale dal mercato live di Binance.
+    - Zero soldi veri a rischio e zero API keys richieste per il paper trading.
+    - Gestisce un conto virtuale da 100$ con compounding al 95% e circuit breaker a 50$.
+    """
+    def __init__(
+        self,
+        config_path: str = "config/config.yaml",
+        model_path: str = "models/tcn_best_model.pth",
+        scaler_path: str = "models/scaler.pkl"
+    ):
+        self.config = load_config(config_path)
+        self.symbol = self.config["market"]["symbol"]
+        self.timeframe = self.config["market"]["timeframe"]
+        self.taker_fee = self.config["market"]["taker_fee"]
+        self.max_holding = self.config["decision"]["max_holding_bars"]
+        
+        self.long_thresh = self.config["decision"]["long_prob_threshold"]
+        self.short_thresh = self.config["decision"]["short_prob_threshold"]
+        self.ratio_thresh = self.config["decision"]["directional_ratio_threshold"]
+
+        # Carica il ledger di paper trading
+        init_bal = self.config["execution"].get("initial_paper_balance", 100.0)
+        cb_min = self.config["execution"].get("circuit_breaker_min_balance", 50.0)
+        self.ledger = PaperTradingLedger(initial_balance=init_bal, circuit_breaker_min=cb_min)
+
+        # Inizializza Scaler e Modello TCN
+        logger.info(f"Caricamento Scaler da {scaler_path}...")
+        self.scaler = FeatureScaler.load(scaler_path)
+
+        logger.info(f"Caricamento Modello TCN da {model_path}...")
+        self.device = torch.device("cpu")
+        self.model = TemporalConvolutionalNetwork(
+            num_features=len(FEATURE_COLUMNS),
+            channels=self.config["model"]["channels"],
+            kernel_size=self.config["model"]["kernel_size"],
+            dropout=0.0,
+            use_layer_norm=self.config["model"]["use_layer_norm"],
+            num_classes=self.config["model"]["num_classes"]
+        )
+        self.model.load_state_dict(torch.load(model_path, map_location=self.device))
+        self.model.eval()
+
+        # Inizializza CCXT su Binance Futures PRODUZIONE (Dati Reali Live)
+        self._init_exchange()
+
+    def _init_exchange(self):
+        # Connessione al mercato pubblico di produzione (nessuna API key necessaria per paper trading)
+        self.exchange = ccxt.binance({
+            "enableRateLimit": True,
+            "options": {
+                "defaultType": "future",
+            }
+        })
+        logger.info("Connesso al Mercato LIVE REALE di Binance Futures (Zero API keys richieste per Paper Trading).")
+
+    def fetch_live_data(self, min_bars: int = 300) -> pd.DataFrame:
+        """Scarica le ultime 300 barre 4H reali dal live market di Binance."""
+        target_symbol = f"{self.symbol}:USDT"
+        ohlcv = self.exchange.fetch_ohlcv(target_symbol, timeframe=self.timeframe, limit=min_bars)
+        
+        df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+        for col in ["open", "high", "low", "close", "volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        try:
+            funding = self.exchange.fetch_funding_rate(target_symbol)
+            df["funding_rate"] = float(funding.get("fundingRate", 0.0))
+        except Exception:
+            df["funding_rate"] = 0.0
+
+        return df
+
+    def get_realtime_ticker(self) -> float:
+        """Recupera il prezzo esatto di ultimo scambio (tick-by-tick) da Binance."""
+        ticker = self.exchange.fetch_ticker(f"{self.symbol}:USDT")
+        return float(ticker["last"])
+
+    def evaluate(self):
+        """Esegue un ciclo di valutazione: gestisce trade aperti e valuta nuovi ingressi."""
+        if self.ledger.is_circuit_breaker_active():
+            logger.error(
+                f"🚨 CIRCUIT BREAKER ATTIVO! Saldo ({self.ledger.balance:.2f} USDT) inferiore a "
+                f"{self.ledger.circuit_breaker_min:.2f} USDT. Trading sospeso per tutela capitale."
+            )
+            return
+
+        live_price = self.get_realtime_ticker()
+        logger.info(f"=== Valutazione Mercato Realnet: {self.symbol} ===")
+        logger.info(f"Prezzo BTC Live: {live_price:.2f} USDT | Saldo Paper: {self.ledger.balance:.2f} USDT")
+
+        # 1. Controlla e gestisci l'eventuale posizione aperta
+        if self.ledger.position is not None:
+            self._manage_open_position(live_price)
+            return
+
+        # 2. Nessuna posizione aperta: scarica dati ed estrai feature per nuova predizione
+        df_raw = self.fetch_live_data(min_bars=300)
+        df_feat = extract_features(
+            df_raw,
+            sma_short=self.config["features"]["sma_short"],
+            sma_long=self.config["features"]["sma_long"],
+            atr_period=self.config["features"]["atr_period"],
+            vol_period=self.config["features"]["volume_ma_period"]
+        )
+
+        lookback = self.config["features"]["lookback_window"]
+        latest_window = df_feat.iloc[-lookback:].copy()
+        current_atr = latest_window["norm_atr"].iloc[-1]
+        last_bar_time = latest_window["timestamp"].iloc[-1]
+
+        # Inferenza TCN
+        x_scaled = self.scaler.transform(latest_window)
+        x_tensor = torch.tensor(x_scaled.T, dtype=torch.float32).unsqueeze(0)
+
+        with torch.no_grad():
+            probs = self.model.predict_probabilities(x_tensor).numpy()[0]
+
+        p_neutral, p_long, p_short = probs
+        logger.info(
+            f"Ultima barra chiusa: {last_bar_time} | "
+            f"P(Neutral): {p_neutral*100:.1f}% | P(Long): {p_long*100:.1f}% | P(Short): {p_short*100:.1f}%"
+        )
+
+        # Decision Engine deterministico con soglie calibrate
+        if p_long >= self.long_thresh and p_long >= (self.ratio_thresh * p_short):
+            logger.info(f"🟢 SEGNALE FORTE LONG RILEVATO (P={p_long:.2f})")
+            self._open_trade("LONG", live_price, current_atr)
+        elif p_short >= self.short_thresh and p_short >= (self.ratio_thresh * p_long):
+            logger.info(f"🔴 SEGNALE FORTE SHORT RILEVATO (P={p_short:.2f})")
+            self._open_trade("SHORT", live_price, current_atr)
+        else:
+            logger.info("⚪ Nessun segnale direzionale netto sopra soglia -> Mantieni stato Flat.")
+
+    def _open_trade(self, direction: str, entry_price: float, norm_atr: float):
+        # Target Dinamici ATR vincenti dell'Esperimento 2
+        atr_mult_tp = self.config["execution"].get("atr_multiplier_target", 2.2)
+        atr_mult_sl = self.config["execution"].get("atr_multiplier_sl", 1.4)
+        
+        target_tp_pct = max(0.015, norm_atr * atr_mult_tp)
+        target_sl_pct = max(0.010, norm_atr * atr_mult_sl)
+
+        tp_price = entry_price * (1.0 + target_tp_pct) if direction == "LONG" else entry_price * (1.0 - target_tp_pct)
+        sl_price = entry_price * (1.0 - target_sl_pct) if direction == "LONG" else entry_price * (1.0 + target_sl_pct)
+
+        # Compounding: alloca il 95% del saldo corrente (all-in a Leva 1x con stop loss)
+        alloc_pct = self.config["execution"].get("compounding_allocation_pct", 0.95)
+        trade_size = max(20.0, self.ledger.balance * alloc_pct)
+
+        pos_data = {
+            "direction": direction,
+            "entry_price": entry_price,
+            "entry_time": datetime.now(timezone.utc).isoformat(),
+            "tp_price": tp_price,
+            "sl_price": sl_price,
+            "tp_pct": target_tp_pct,
+            "sl_pct": target_sl_pct,
+            "holding_bars": 0,
+            "size_usdt": trade_size
+        }
+
+        self.ledger.state["current_position"] = pos_data
+        self.ledger.save()
+
+        logger.info(
+            f"✅ [PAPER TRADE APERTO] {direction} | Entry: {entry_price:.2f} USDT | "
+            f"Size: {trade_size:.2f} USDT | TP: {tp_price:.2f} (+{target_tp_pct*100:.2f}%) | "
+            f"SL: {sl_price:.2f} (-{target_sl_pct*100:.2f}%)"
+        )
+
+    def _manage_open_position(self, current_price: float):
+        pos = self.ledger.position
+        pos["holding_bars"] += 1
+        direction = pos["direction"]
+        entry_price = pos["entry_price"]
+
+        # Recupera candele a 1 minuto per catturare ombre/spike senza perdere opportunità
+        now_ms = self.exchange.milliseconds()
+        last_check_ms = pos.get("last_check_ms", now_ms - (15 * 60 * 1000))
+        pos["last_check_ms"] = now_ms
+
+        high_reach = current_price
+        low_reach = current_price
+        try:
+            candles_1m = self.exchange.fetch_ohlcv(f"{self.symbol}:USDT", timeframe="1m", since=last_check_ms, limit=100)
+            if candles_1m:
+                high_reach = max(c[2] for c in candles_1m)
+                low_reach = min(c[3] for c in candles_1m)
+        except Exception as e:
+            logger.warning(f"Impossibile scaricare candele 1m ({e}), uso prezzo istantaneo.")
+
+        # Calcolo PnL Floating corrente
+        if direction == "LONG":
+            floating_pnl_pct = (current_price - entry_price) / entry_price
+        else:
+            floating_pnl_pct = (entry_price - current_price) / entry_price
+
+        floating_pnl_usdt = pos["size_usdt"] * floating_pnl_pct
+        logger.info(
+            f"Posizione Aperta {direction}: Prezzo {current_price:.2f} USDT | "
+            f"PnL Flottante: {floating_pnl_pct*100:+.2f}% ({floating_pnl_usdt:+.2f} USDT) | "
+            f"Intervallo High: {high_reach:.2f} / Low: {low_reach:.2f} | "
+            f"TP: {pos['tp_price']:.2f} | SL: {pos['sl_price']:.2f} | Barre: {pos['holding_bars']}/{self.max_holding}"
+        )
+
+        exit_reason = None
+        exit_price = current_price
+        if direction == "LONG":
+            if high_reach >= pos["tp_price"] and low_reach <= pos["sl_price"]:
+                exit_reason = "STOP_LOSS"
+                exit_price = pos["sl_price"]
+            elif low_reach <= pos["sl_price"]:
+                exit_reason = "STOP_LOSS"
+                exit_price = pos["sl_price"]
+            elif high_reach >= pos["tp_price"]:
+                exit_reason = "TAKE_PROFIT"
+                exit_price = pos["tp_price"]
+            elif pos["holding_bars"] >= self.max_holding:
+                exit_reason = "TIME_STOP"
+                exit_price = current_price
+        else: # SHORT
+            if low_reach <= pos["tp_price"] and high_reach >= pos["sl_price"]:
+                exit_reason = "STOP_LOSS"
+                exit_price = pos["sl_price"]
+            elif high_reach >= pos["sl_price"]:
+                exit_reason = "STOP_LOSS"
+                exit_price = pos["sl_price"]
+            elif low_reach <= pos["tp_price"]:
+                exit_reason = "TAKE_PROFIT"
+                exit_price = pos["tp_price"]
+            elif pos["holding_bars"] >= self.max_holding:
+                exit_reason = "TIME_STOP"
+                exit_price = current_price
+
+        if exit_reason:
+            self._close_trade(pos, exit_price, exit_reason)
+
+    def _close_trade(self, pos: Dict[str, Any], exit_price: float, reason: str):
+        direction = pos["direction"]
+        entry_price = pos["entry_price"]
+
+        if direction == "LONG":
+            gross_return = (exit_price - entry_price) / entry_price
+        else:
+            gross_return = (entry_price - exit_price) / entry_price
+
+        round_trip_fee = 2 * self.taker_fee
+        net_return = gross_return - round_trip_fee
+        fee_usdt = pos["size_usdt"] * round_trip_fee
+        net_pnl_usdt = pos["size_usdt"] * net_return
+
+        # Aggiorna ledger
+        new_balance = self.ledger.balance + net_pnl_usdt
+        self.ledger.state["current_balance"] = round(new_balance, 2)
+        self.ledger.state["total_pnl_usdt"] = round(self.ledger.state.get("total_pnl_usdt", 0.0) + net_pnl_usdt, 2)
+        self.ledger.state["total_fees_usdt"] = round(self.ledger.state.get("total_fees_usdt", 0.0) + fee_usdt, 2)
+
+        trade_record = {
+            "direction": direction,
+            "entry_time": pos["entry_time"],
+            "exit_time": datetime.now(timezone.utc).isoformat(),
+            "entry_price": entry_price,
+            "exit_price": exit_price,
+            "reason": reason,
+            "size_usdt": pos["size_usdt"],
+            "net_pnl_usdt": round(net_pnl_usdt, 2),
+            "net_return_pct": round(net_return * 100, 2),
+            "fee_paid_usdt": round(fee_usdt, 2),
+            "duration_bars": pos["holding_bars"]
+        }
+
+        self.ledger.state["closed_trades"].append(trade_record)
+        self.ledger.state["current_position"] = None
+
+        # Ricalcola Win Rate
+        closed = self.ledger.state["closed_trades"]
+        wins = [t for t in closed if t["net_pnl_usdt"] > 0]
+        self.ledger.state["win_rate_pct"] = round((len(wins) / len(closed)) * 100, 1) if closed else 0.0
+        self.ledger.save()
+
+        logger.info(
+            f"🔔 [PAPER TRADE CHIUSO] {direction} per {reason} a {exit_price:.2f} USDT! "
+            f"PnL Netto: {net_pnl_usdt:+.2f} USDT ({net_return*100:+.2f}%) | "
+            f"Nuovo Saldo: {new_balance:.2f} USDT | WinRate: {self.ledger.state['win_rate_pct']}%"
+        )
+
+    def print_status(self):
+        """Stampa un report completo dello stato corrente del Paper Trading."""
+        st = self.ledger.state
+        print("\n" + "=" * 60)
+        print("📊 REPORT PAPER TRADING REALNET BINANCE FUTURES (LIVE)")
+        print("=" * 60)
+        print(f"Saldo Iniziale:     {st.get('initial_balance', 100.0):.2f} USDT")
+        print(f"Saldo Corrente:     {st.get('current_balance', 100.0):.2f} USDT")
+        print(f"Profitto Netto Tot: {st.get('total_pnl_usdt', 0.0):+.2f} USDT ({((st.get('current_balance',100)-st.get('initial_balance',100))/st.get('initial_balance',100)*100):+.2f}%)")
+        print(f"Commissioni Pagate: {st.get('total_fees_usdt', 0.0):.2f} USDT")
+        print(f"Trade Chiusi:       {len(st.get('closed_trades', []))}")
+        print(f"Win Rate:           {st.get('win_rate_pct', 0.0):.1f}%")
+        print(f"Circuit Breaker:    {'ATTIVO (Trading Bloccato)' if st.get('circuit_breaker_triggered') else 'OK (Soglia 50.00 USDT)'}")
+
+        pos = st.get("current_position")
+        if pos:
+            live_price = self.get_realtime_ticker()
+            ret = (live_price - pos['entry_price'])/pos['entry_price'] if pos['direction'] == 'LONG' else (pos['entry_price'] - live_price)/pos['entry_price']
+            pnl = pos['size_usdt'] * ret
+            print("\nPOSIZIONE ATTIVA:")
+            print(f"  Direzione:     {pos['direction']}")
+            print(f"  Prezzo Entry:  {pos['entry_price']:.2f} USDT")
+            print(f"  Prezzo Live:   {live_price:.2f} USDT")
+            print(f"  PnL Flottante: {ret*100:+.2f}% ({pnl:+.2f} USDT)")
+            print(f"  Take Profit:   {pos['tp_price']:.2f}")
+            print(f"  Stop Loss:     {pos['sl_price']:.2f}")
+            print(f"  Size Trade:    {pos['size_usdt']:.2f} USDT")
+        else:
+            print("\nPosizione Attiva:   NESSUNA (Stato Flat)")
+        print("=" * 60 + "\n")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Live Realnet Paper Trading Agent con TCN")
+    parser.add_argument("--status", action="store_true", help="Mostra lo stato e lo storico del Paper Trading")
+    parser.add_argument("--loop", action="store_true", help="Esegui in loop continuo monitorando ogni N minuti")
+    parser.add_argument("--interval", type=int, default=15, help="Intervallo di controllo in minuti per la modalità loop (default: 15)")
+    args = parser.parse_args()
+
+    agent = RealnetPaperAgent()
+
+    if args.status:
+        agent.print_status()
+        return
+
+    if args.loop:
+        logger.info(f"Avvio monitoraggio continuo Realnet (controllo ogni {args.interval} minuti). Premi Ctrl+C per fermare.")
+        try:
+            while True:
+                agent.evaluate()
+                time.sleep(args.interval * 60)
+        except KeyboardInterrupt:
+            logger.info("Monitoraggio interrotto dall'utente.")
+    else:
+        # Singola valutazione istantanea
+        agent.evaluate()
+        agent.print_status()
+
+
+if __name__ == "__main__":
+    main()

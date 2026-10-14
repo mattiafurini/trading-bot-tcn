@@ -1,0 +1,22 @@
+# Virtual Environment
+.venv/
+env/
+venv/
+ENV/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Runtime paper trading ledger & logs
+data/paper_trading_ledger.json
+logs/
+*.log
+.ipynb_checkpoints/
+scratch/
+
+# OS specific
+.DS_Store
+Thumbs.db
