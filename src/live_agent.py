@@ -152,6 +152,12 @@ class RealnetPaperAgent:
         except Exception:
             df["funding_rate"] = 0.0
 
+        # Escludi l'ultima candela se ancora in formazione (aperta da meno di 4 ore)
+        # per calcolare indicatori e feature solo su barre 4H storicamente consolidate
+        now_ts = pd.Timestamp.now(tz=timezone.utc)
+        if len(df) > 0 and (now_ts - df["timestamp"].iloc[-1]).total_seconds() < 4 * 3600:
+            df = df.iloc[:-1].reset_index(drop=True)
+
         return df
 
     def get_realtime_ticker(self) -> float:
@@ -253,9 +259,16 @@ class RealnetPaperAgent:
 
     def _manage_open_position(self, current_price: float):
         pos = self.ledger.position
-        pos["holding_bars"] += 1
         direction = pos["direction"]
         entry_price = pos["entry_price"]
+
+        # Calcolo del tempo reale trascorso dall'apertura
+        entry_time = datetime.fromisoformat(pos["entry_time"])
+        now_time = datetime.now(timezone.utc)
+        elapsed_hours = (now_time - entry_time).total_seconds() / 3600.0
+        elapsed_bars = elapsed_hours / 4.0
+        pos["holding_bars"] = round(elapsed_bars, 2)
+        is_time_stop = elapsed_bars >= self.max_holding
 
         # Recupera candele a 1 minuto per catturare ombre/spike senza perdere opportunità
         now_ms = self.exchange.milliseconds()
@@ -283,7 +296,8 @@ class RealnetPaperAgent:
             f"Posizione Aperta {direction}: Prezzo {current_price:.2f} USDT | "
             f"PnL Flottante: {floating_pnl_pct*100:+.2f}% ({floating_pnl_usdt:+.2f} USDT) | "
             f"Intervallo High: {high_reach:.2f} / Low: {low_reach:.2f} | "
-            f"TP: {pos['tp_price']:.2f} | SL: {pos['sl_price']:.2f} | Barre: {pos['holding_bars']}/{self.max_holding}"
+            f"TP: {pos['tp_price']:.2f} | SL: {pos['sl_price']:.2f} | "
+            f"Durata: {elapsed_hours:.1f}h ({pos['holding_bars']:.1f}/{self.max_holding} barre 4H)"
         )
 
         exit_reason = None
@@ -298,7 +312,7 @@ class RealnetPaperAgent:
             elif high_reach >= pos["tp_price"]:
                 exit_reason = "TAKE_PROFIT"
                 exit_price = pos["tp_price"]
-            elif pos["holding_bars"] >= self.max_holding:
+            elif is_time_stop:
                 exit_reason = "TIME_STOP"
                 exit_price = current_price
         else: # SHORT
@@ -311,12 +325,14 @@ class RealnetPaperAgent:
             elif low_reach <= pos["tp_price"]:
                 exit_reason = "TAKE_PROFIT"
                 exit_price = pos["tp_price"]
-            elif pos["holding_bars"] >= self.max_holding:
+            elif is_time_stop:
                 exit_reason = "TIME_STOP"
                 exit_price = current_price
 
         if exit_reason:
             self._close_trade(pos, exit_price, exit_reason)
+        else:
+            self.ledger.save()
 
     def _close_trade(self, pos: Dict[str, Any], exit_price: float, reason: str):
         direction = pos["direction"]
@@ -370,9 +386,9 @@ class RealnetPaperAgent:
     def print_status(self):
         """Stampa un report completo dello stato corrente del Paper Trading."""
         st = self.ledger.state
-        print("\n" + "=" * 60)
+        print("\n" + "=" * 65)
         print("📊 REPORT PAPER TRADING REALNET BINANCE FUTURES (LIVE)")
-        print("=" * 60)
+        print("=" * 65)
         print(f"Saldo Iniziale:     {st.get('initial_balance', 100.0):.2f} USDT")
         print(f"Saldo Corrente:     {st.get('current_balance', 100.0):.2f} USDT")
         print(f"Profitto Netto Tot: {st.get('total_pnl_usdt', 0.0):+.2f} USDT ({((st.get('current_balance',100)-st.get('initial_balance',100))/st.get('initial_balance',100)*100):+.2f}%)")
@@ -381,11 +397,26 @@ class RealnetPaperAgent:
         print(f"Win Rate:           {st.get('win_rate_pct', 0.0):.1f}%")
         print(f"Circuit Breaker:    {'ATTIVO (Trading Bloccato)' if st.get('circuit_breaker_triggered') else 'OK (Soglia 50.00 USDT)'}")
 
+        closed = st.get('closed_trades', [])
+        if closed:
+            print("\nSTORICO ULTIMI TRADE CHIUSI:")
+            for i, t in enumerate(closed[-5:], 1):
+                pnl = t.get('net_pnl_usdt', 0.0)
+                ret = t.get('net_return_pct', 0.0)
+                reason = t.get('reason', '-')
+                dur = t.get('duration_bars', 0.0)
+                print(f"  {i}. {t['direction']:<5} | In: {t['entry_price']:.1f} -> Out: {t['exit_price']:.1f} | PnL: {pnl:+.2f} USDT ({ret:+.2f}%) | {reason} ({dur:.1f} barre 4H)")
+
         pos = st.get("current_position")
         if pos:
             live_price = self.get_realtime_ticker()
             ret = (live_price - pos['entry_price'])/pos['entry_price'] if pos['direction'] == 'LONG' else (pos['entry_price'] - live_price)/pos['entry_price']
             pnl = pos['size_usdt'] * ret
+
+            entry_time = datetime.fromisoformat(pos["entry_time"])
+            elapsed_h = (datetime.now(timezone.utc) - entry_time).total_seconds() / 3600.0
+            elapsed_b = elapsed_h / 4.0
+
             print("\nPOSIZIONE ATTIVA:")
             print(f"  Direzione:     {pos['direction']}")
             print(f"  Prezzo Entry:  {pos['entry_price']:.2f} USDT")
@@ -394,9 +425,10 @@ class RealnetPaperAgent:
             print(f"  Take Profit:   {pos['tp_price']:.2f}")
             print(f"  Stop Loss:     {pos['sl_price']:.2f}")
             print(f"  Size Trade:    {pos['size_usdt']:.2f} USDT")
+            print(f"  Durata:        {elapsed_h:.1f} ore trascorse ({elapsed_b:.1f}/{self.max_holding} barre 4H)")
         else:
             print("\nPosizione Attiva:   NESSUNA (Stato Flat)")
-        print("=" * 60 + "\n")
+        print("=" * 65 + "\n")
 
 
 def main():
