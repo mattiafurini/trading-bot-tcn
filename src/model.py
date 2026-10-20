@@ -168,6 +168,92 @@ class TemporalConvolutionalNetwork(nn.Module):
             return F.softmax(logits, dim=-1)
 
 
+class EnsembleTCN(nn.Module):
+    """
+    Deep Ensemble Bagging di N reti TCN causali indipendenti.
+    Media le distribuzioni di probabilità Softmax per abbattere la varianza statistica,
+    ridurre i falsi breakout da wick casuali ed elevare la qualità delle predizioni.
+    """
+    def __init__(self, models: List[TemporalConvolutionalNetwork]):
+        super().__init__()
+        self.models = nn.ModuleList(models)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        logits_list = [m(x) for m in self.models]
+        return torch.stack(logits_list, dim=0).mean(dim=0)
+
+    def predict_probabilities(self, x: torch.Tensor) -> torch.Tensor:
+        self.eval()
+        with torch.no_grad():
+            probs_list = [m.predict_probabilities(x) for m in self.models]
+            return torch.stack(probs_list, dim=0).mean(dim=0)
+
+    def save(self, filepath: str):
+        state = {
+            "type": "ensemble_tcn",
+            "num_models": len(self.models),
+            "state_dicts": [m.state_dict() for m in self.models]
+        }
+        torch.save(state, filepath)
+
+    @classmethod
+    def load(
+        cls,
+        filepath: str,
+        num_features: int,
+        channels: List[int] = [32, 32, 48, 48, 64],
+        kernel_size: int = 3,
+        dropout: float = 0.0,
+        use_layer_norm: bool = True,
+        num_classes: int = 3,
+        device: torch.device = torch.device("cpu")
+    ):
+        data = torch.load(filepath, map_location=device)
+        if isinstance(data, dict) and data.get("type") == "ensemble_tcn":
+            models = []
+            for sd in data["state_dicts"]:
+                m = TemporalConvolutionalNetwork(
+                    num_features=num_features,
+                    channels=channels,
+                    kernel_size=kernel_size,
+                    dropout=dropout,
+                    use_layer_norm=use_layer_norm,
+                    num_classes=num_classes
+                ).to(device)
+                m.load_state_dict(sd)
+                m.eval()
+                models.append(m)
+            return cls(models)
+        elif isinstance(data, dict) and "state_dicts" in data:
+            models = []
+            for sd in data["state_dicts"]:
+                m = TemporalConvolutionalNetwork(
+                    num_features=num_features,
+                    channels=channels,
+                    kernel_size=kernel_size,
+                    dropout=dropout,
+                    use_layer_norm=use_layer_norm,
+                    num_classes=num_classes
+                ).to(device)
+                m.load_state_dict(sd)
+                m.eval()
+                models.append(m)
+            return cls(models)
+        else:
+            # Fallback per modello singolo caricato come ensemble di 1
+            m = TemporalConvolutionalNetwork(
+                num_features=num_features,
+                channels=channels,
+                kernel_size=kernel_size,
+                dropout=dropout,
+                use_layer_norm=use_layer_norm,
+                num_classes=num_classes
+            ).to(device)
+            m.load_state_dict(data)
+            m.eval()
+            return cls([m])
+
+
 def count_parameters(model: nn.Module) -> int:
     """Calcola il numero totale di parametri addestrabili."""
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -183,3 +269,8 @@ if __name__ == "__main__":
     print(f"  Parametri addestrabili: {count_parameters(model):,}")
     print(f"  Shape output logits: {output.shape}")
     print(f"  Shape output probs:  {probs.shape}")
+
+    # Test EnsembleTCN
+    ensemble = EnsembleTCN([model, model])
+    ens_probs = ensemble.predict_probabilities(sample_input)
+    print(f"Ensemble (2 modelli) output probs shape: {ens_probs.shape}")

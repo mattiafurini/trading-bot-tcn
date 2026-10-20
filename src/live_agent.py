@@ -17,7 +17,7 @@ import ccxt
 
 from src.data_loader import load_config
 from src.features import extract_features, FeatureScaler, FEATURE_COLUMNS
-from src.model import TemporalConvolutionalNetwork
+from src.model import TemporalConvolutionalNetwork, EnsembleTCN
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -83,6 +83,7 @@ class RealnetPaperAgent:
     Agente di Paper Trading sul Mercato REALE (Realnet Binance Futures).
     - Riceve i prezzi autentici e in tempo reale dal mercato live di Binance.
     - Zero soldi veri a rischio e zero API keys richieste per il paper trading.
+    - Supporta sia il Deep Ensemble (tcn_ensemble.pth) sia il modello singolo (tcn_best_model.pth).
     - Gestisce un conto virtuale da 100$ con compounding al 95% e circuit breaker a 50$.
     """
     def __init__(
@@ -106,22 +107,31 @@ class RealnetPaperAgent:
         cb_min = self.config["execution"].get("circuit_breaker_min_balance", 50.0)
         self.ledger = PaperTradingLedger(initial_balance=init_bal, circuit_breaker_min=cb_min)
 
-        # Inizializza Scaler e Modello TCN
+        # Inizializza Scaler
         logger.info(f"Caricamento Scaler da {scaler_path}...")
         self.scaler = FeatureScaler.load(scaler_path)
 
-        logger.info(f"Caricamento Modello TCN da {model_path}...")
+        # Controlla se è disponibile un Deep Ensemble di TCN
+        models_dir = os.path.dirname(model_path) if os.path.dirname(model_path) else "models"
+        ensemble_candidate = os.path.join(models_dir, "tcn_ensemble.pth")
+        target_path = ensemble_candidate if os.path.exists(ensemble_candidate) else model_path
+
+        logger.info(f"Caricamento Rete Neurale da {target_path}...")
         self.device = torch.device("cpu")
-        self.model = TemporalConvolutionalNetwork(
+        self.model = EnsembleTCN.load(
+            target_path,
             num_features=len(FEATURE_COLUMNS),
             channels=self.config["model"]["channels"],
             kernel_size=self.config["model"]["kernel_size"],
             dropout=0.0,
             use_layer_norm=self.config["model"]["use_layer_norm"],
-            num_classes=self.config["model"]["num_classes"]
+            num_classes=self.config["model"]["num_classes"],
+            device=self.device
         )
-        self.model.load_state_dict(torch.load(model_path, map_location=self.device))
-        self.model.eval()
+        if len(self.model.models) > 1:
+            logger.info(f"🧠 Deep Ensemble Attivo con {len(self.model.models)} reti TCN collaborative!")
+        else:
+            logger.info("Modello Singolo TCN caricato con successo.")
 
         # Inizializza CCXT su Binance Futures PRODUZIONE (Dati Reali Live)
         self._init_exchange()

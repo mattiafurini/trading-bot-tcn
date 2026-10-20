@@ -49,8 +49,8 @@ Questo notebook esegue in successione automatica i **3 esperimenti chiave** per 
 
 1. **Esperimento 1 — Grid Search su Validation Set:** Confronta 3 configurazioni di regolarizzazione (`learning_rate`, `dropout`, `weight_decay`) e seleziona oggettivamente la vincente su `val_loss` e `val_f1`.
 2. **Esperimento 2 — Dynamic ATR Volatility Barriers:** Rimpiazza le percentuali fisse con barriere adattive basate sull'Average True Range per seguire la volatilità di mercato ($2.2 \times ATR$ e $1.4 \times ATR$).
-3. **Esperimento 3 — Advanced Execution (Trailing Stop a Breakeven + Compound Sizing 25%):** Sposta lo stop loss a breakeven dopo $+1.2\%$ di profitto, attiva il trailing stop e alloca il $25\%$ del conto con reinvestimento dei profitti.
-4. **Tabella Comparativa Finale & Champion Export:** Grafico multi-equity curve a confronto e salvataggio dei pesi del modello vincitore `tcn_champion_model.pth`.
+3. **Esperimento 3 — Deep Ensemble Consensus (5-TCN Multi-Seed Bagging):** Addestra 5 reti TCN indipendenti con semi casuali differenti (`[42, 101, 777, 1337, 2024]`), aggrega le probabilità predittive via soft-voting ensemble per cancellare la varianza stocastica ed elevare Sharpe Ratio e stabilità.
+4. **Tabella Comparativa Finale & Champion Export:** Grafico multi-equity curve a confronto e salvataggio sia dell'ensemble `tcn_ensemble.pth` che del modello singolo `tcn_best_model.pth`.
 """)
 
 # Cell 2: Dependencies
@@ -355,6 +355,30 @@ class TemporalConvolutionalNetwork(nn.Module):
         self.eval()
         with torch.no_grad():
             return F.softmax(self.forward(x), dim=-1)
+
+class EnsembleTCN(nn.Module):
+    \"\"\"Deep Ensemble di N TCN indipendenti con media Softmax.\"\"\"
+    def __init__(self, models):
+        super().__init__()
+        self.models = nn.ModuleList(models)
+
+    def forward(self, x):
+        logits_list = [m(x) for m in self.models]
+        return torch.stack(logits_list, dim=0).mean(dim=0)
+
+    def predict_probabilities(self, x):
+        self.eval()
+        with torch.no_grad():
+            probs_list = [m.predict_probabilities(x) for m in self.models]
+            return torch.stack(probs_list, dim=0).mean(dim=0)
+
+    def save(self, filepath):
+        state = {
+            "type": "ensemble_tcn",
+            "num_models": len(self.models),
+            "state_dicts": [m.state_dict() for m in self.models]
+        }
+        torch.save(state, filepath)
 """)
 
 # Cell 8: Split & Training Utility
@@ -384,8 +408,8 @@ def prepare_splits(df_labeled):
 
     return (train_df, val_df, test_df), (train_loader, val_loader, test_loader), scaler
 
-def train_tcn_model(train_loader, val_loader, train_y, lr=3e-4, dropout=0.30, weight_decay=0.01, max_epochs=35, patience=8):
-    set_seed(42)
+def train_tcn_model(train_loader, val_loader, train_y, lr=3e-4, dropout=0.30, weight_decay=0.01, max_epochs=35, patience=8, seed=42):
+    set_seed(seed)
     model = TemporalConvolutionalNetwork(
         num_features=len(FEATURE_COLUMNS),
         channels=BASE_CONFIG["channels"],
@@ -671,28 +695,39 @@ res_exp2 = run_simulation(
 print(f"Risultati Test Exp 2 (Dynamic ATR): Return={res_exp2['total_return_pct']}% | WinRate={res_exp2['win_rate_pct']}% | Trades={res_exp2['total_trades']} | DD={res_exp2['max_drawdown_pct']}%")
 """)
 
-# Cell 12: Experiment 3: Trailing Stop & Compound Sizing
+# Cell 12: Experiment 3: Deep Ensemble (5 TCN Multi-Seed Bagging)
 add_code("""# =====================================================================
-# ESPERIMENTO 3: Trailing Stop a Breakeven + Compound Sizing (25%)
+# ESPERIMENTO 3: Deep Ensemble (5-TCN Multi-Seed Bagging Consensus)
 # =====================================================================
-print("--- AVVIO ESPERIMENTO 3: Advanced Execution (Breakeven Trailing + 25% Compound Sizing) ---")
-# Utilizziamo le predizioni del modello più performante tra Exp 1 ed Exp 2
-champion_model = model_exp2 if res_exp2["total_return_pct"] >= res_exp1["total_return_pct"] else best_exp1_model
-champion_probs = probs_exp2 if res_exp2["total_return_pct"] >= res_exp1["total_return_pct"] else probs_exp1
-champion_bars = test_bars2 if res_exp2["total_return_pct"] >= res_exp1["total_return_pct"] else test_bars
-champion_scaler = scaler_exp2 if res_exp2["total_return_pct"] >= res_exp1["total_return_pct"] else scaler_exp1
+print("--- AVVIO ESPERIMENTO 3: Deep Ensemble (5 Reti TCN Collaborative) ---")
+ENSEMBLE_SEEDS = [42, 101, 777, 1337, 2024]
+ensemble_models = []
+
+for i, s in enumerate(ENSEMBLE_SEEDS, 1):
+    print(f"Training Membro Ensemble #{i}/{len(ENSEMBLE_SEEDS)} (Seed={s})...")
+    m, v_loss_m, v_f1_m = train_tcn_model(
+        train_loader2, val_loader2, train_df2["label"].values,
+        lr=best_exp1_cfg["lr"],
+        dropout=best_exp1_cfg["dropout"],
+        weight_decay=best_exp1_cfg["wd"],
+        seed=s
+    )
+    print(f"  --> Membro #{i} terminato: Val Loss: {v_loss_m:.4f} | Val F1: {v_f1_m:.4f}")
+    ensemble_models.append(m)
+
+ensemble = EnsembleTCN(ensemble_models)
+probs_exp3 = predict_probabilities(ensemble, test_loader2)
+test_bars3 = test_bars2
 
 res_exp3 = run_simulation(
-    champion_bars, champion_probs,
+    test_bars3, probs_exp3,
     prob_threshold=0.38, ratio_threshold=1.25,
-    use_dynamic_atr=True if res_exp2["total_return_pct"] >= res_exp1["total_return_pct"] else False,
-    fixed_tp_pct=0.028, fixed_sl_pct=0.018,
-    use_trailing_stop=True,
-    breakeven_trigger_pct=0.012, # A +1.2% profitto, stop loss a breakeven
-    capital_allocation_pct=0.25  # 25% capitale compounding per massimizzare rendimento
+    use_dynamic_atr=True,
+    atr_mult_tp=2.2, atr_mult_sl=1.4,
+    capital_allocation_pct=0.10
 )
 
-print(f"Risultati Test Exp 3 (Trailing + Compound): Return={res_exp3['total_return_pct']}% | WinRate={res_exp3['win_rate_pct']}% | Trades={res_exp3['total_trades']} | DD={res_exp3['max_drawdown_pct']}%")
+print(f"Risultati Test Exp 3 (5-TCN Ensemble): Return={res_exp3['total_return_pct']}% | WinRate={res_exp3['win_rate_pct']}% | Trades={res_exp3['total_trades']} | DD={res_exp3['max_drawdown_pct']}%")
 """)
 
 # Cell 13: Summary Comparison & Export
@@ -717,7 +752,7 @@ summary_df = pd.DataFrame([
         "Trade Totali": res_exp2["total_trades"]
     },
     {
-        "Esperimento": "3. Trailing Stop + Compound 25%",
+        "Esperimento": "3. 5-TCN Deep Ensemble",
         "Rendimento %": f"{res_exp3['total_return_pct']:+.2f}%",
         "Max Drawdown %": f"{res_exp3['max_drawdown_pct']:.2f}%",
         "Win Rate %": f"{res_exp3['win_rate_pct']:.1f}%",
@@ -736,7 +771,7 @@ print("="*80 + "\\n")
 plt.figure(figsize=(13, 6))
 plt.plot(res_exp1["equity_curve"], label=f"Exp 1: Baseline Tuned ({res_exp1['total_return_pct']:+.1f}%)", color="#0077b6", lw=1.5)
 plt.plot(res_exp2["equity_curve"], label=f"Exp 2: Dynamic ATR ({res_exp2['total_return_pct']:+.1f}%)", color="#ffaa00", lw=1.5)
-plt.plot(res_exp3["equity_curve"], label=f"Exp 3: Trailing Stop + 25% Compound ({res_exp3['total_return_pct']:+.1f}%)", color="#00a86b", lw=2.2)
+plt.plot(res_exp3["equity_curve"], label=f"Exp 3: 5-TCN Deep Ensemble ({res_exp3['total_return_pct']:+.1f}%)", color="#00a86b", lw=2.2)
 plt.title("TCN Quantitative Trading Bot - Confronto Multi-Esperimento su Test Set (Post-Fee)")
 plt.ylabel("Portfolio Equity ($)")
 plt.xlabel("Barre Temporali (4H)")
@@ -747,18 +782,21 @@ chart_path = "/kaggle/working/comparison_equity_curves.png" if os.path.exists("/
 plt.savefig(chart_path, dpi=200)
 plt.show()
 
-# Salvataggio Pesi e Scaler del Modello Campione
-model_save_path = "/kaggle/working/tcn_best_model.pth" if os.path.exists("/kaggle/working") else "models/tcn_best_model.pth"
+# Salvataggio Pesi e Scaler
+ensemble_save_path = "/kaggle/working/tcn_ensemble.pth" if os.path.exists("/kaggle/working") else "models/tcn_ensemble.pth"
+single_save_path = "/kaggle/working/tcn_best_model.pth" if os.path.exists("/kaggle/working") else "models/tcn_best_model.pth"
 scaler_save_path = "/kaggle/working/scaler.pkl" if os.path.exists("/kaggle/working") else "models/scaler.pkl"
 
-torch.save(champion_model.state_dict(), model_save_path)
+ensemble.save(ensemble_save_path)
+torch.save(model_exp2.state_dict(), single_save_path)
 with open(scaler_save_path, "wb") as f:
-    pickle.dump(champion_scaler, f)
+    pickle.dump(scaler_exp2, f)
 
-print(f"Modello Campione salvato in: {model_save_path}")
-print(f"Scaler Campione salvato in:  {scaler_save_path}")
-print(f"Grafico comparativo salvato: {chart_path}")
-print("\\nScarica questi file per usarli con il bot locale!")
+print(f"Ensemble (5 modelli) salvato in: {ensemble_save_path}")
+print(f"Modello Singolo salvato in:     {single_save_path}")
+print(f"Scaler Campione salvato in:     {scaler_save_path}")
+print(f"Grafico comparativo salvato:    {chart_path}")
+print("\\nEntrambi i modelli sono compatibili al 100% con il live agent!")
 """)
 
 os.makedirs("notebooks", exist_ok=True)
