@@ -18,6 +18,7 @@ import ccxt
 from src.data_loader import load_config
 from src.features import extract_features, FeatureScaler, FEATURE_COLUMNS
 from src.model import TemporalConvolutionalNetwork, EnsembleTCN
+from src.telegram_bot import TelegramNotifier
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -133,6 +134,18 @@ class RealnetPaperAgent:
         else:
             logger.info("Modello Singolo TCN caricato con successo.")
 
+        # Inizializza Notificatore Telegram
+        tg_cfg = self.config.get("telegram", {})
+        self.telegram = TelegramNotifier(
+            token=tg_cfg.get("bot_token"),
+            chat_id=tg_cfg.get("chat_id"),
+            enabled=tg_cfg.get("enabled", True),
+            notify_on_start=tg_cfg.get("notify_on_start", True),
+            notify_on_trade=tg_cfg.get("notify_on_trade", True),
+            notify_on_close=tg_cfg.get("notify_on_close", True),
+            notify_on_circuit_breaker=tg_cfg.get("notify_on_circuit_breaker", True)
+        )
+
         # Inizializza CCXT su Binance Futures PRODUZIONE (Dati Reali Live)
         self._init_exchange()
 
@@ -182,6 +195,7 @@ class RealnetPaperAgent:
                 f"🚨 CIRCUIT BREAKER ATTIVO! Saldo ({self.ledger.balance:.2f} USDT) inferiore a "
                 f"{self.ledger.circuit_breaker_min:.2f} USDT. Trading sospeso per tutela capitale."
             )
+            self.telegram.notify_circuit_breaker(self.ledger.balance, self.ledger.circuit_breaker_min)
             return
 
         live_price = self.get_realtime_ticker()
@@ -222,16 +236,17 @@ class RealnetPaperAgent:
         )
 
         # Decision Engine deterministico con soglie calibrate
+        probs_dict = {"neutral": float(p_neutral), "long": float(p_long), "short": float(p_short)}
         if p_long >= self.long_thresh and p_long >= (self.ratio_thresh * p_short):
             logger.info(f"🟢 SEGNALE FORTE LONG RILEVATO (P={p_long:.2f})")
-            self._open_trade("LONG", live_price, current_atr)
+            self._open_trade("LONG", live_price, current_atr, probs=probs_dict)
         elif p_short >= self.short_thresh and p_short >= (self.ratio_thresh * p_long):
             logger.info(f"🔴 SEGNALE FORTE SHORT RILEVATO (P={p_short:.2f})")
-            self._open_trade("SHORT", live_price, current_atr)
+            self._open_trade("SHORT", live_price, current_atr, probs=probs_dict)
         else:
             logger.info("⚪ Nessun segnale direzionale netto sopra soglia -> Mantieni stato Flat.")
 
-    def _open_trade(self, direction: str, entry_price: float, norm_atr: float):
+    def _open_trade(self, direction: str, entry_price: float, norm_atr: float, probs: Optional[Dict[str, float]] = None):
         # Target Dinamici ATR vincenti dell'Esperimento 2
         atr_mult_tp = self.config["execution"].get("atr_multiplier_target", 2.2)
         atr_mult_sl = self.config["execution"].get("atr_multiplier_sl", 1.4)
@@ -265,6 +280,18 @@ class RealnetPaperAgent:
             f"✅ [PAPER TRADE APERTO] {direction} | Entry: {entry_price:.2f} USDT | "
             f"Size: {trade_size:.2f} USDT | TP: {tp_price:.2f} (+{target_tp_pct*100:.2f}%) | "
             f"SL: {sl_price:.2f} (-{target_sl_pct*100:.2f}%)"
+        )
+
+        self.telegram.notify_trade_opened(
+            direction=direction,
+            symbol=self.symbol,
+            entry_price=entry_price,
+            size_usdt=trade_size,
+            tp_price=tp_price,
+            sl_price=sl_price,
+            tp_pct=target_tp_pct,
+            sl_pct=target_sl_pct,
+            probs=probs
         )
 
     def _manage_open_position(self, current_price: float):
@@ -393,6 +420,19 @@ class RealnetPaperAgent:
             f"Nuovo Saldo: {new_balance:.2f} USDT | WinRate: {self.ledger.state['win_rate_pct']}%"
         )
 
+        self.telegram.notify_trade_closed(
+            direction=direction,
+            symbol=self.symbol,
+            reason=reason,
+            entry_price=entry_price,
+            exit_price=exit_price,
+            net_pnl_usdt=round(net_pnl_usdt, 2),
+            net_return_pct=round(net_return * 100, 2),
+            new_balance=round(new_balance, 2),
+            win_rate_pct=self.ledger.state["win_rate_pct"],
+            duration_bars=pos["holding_bars"]
+        )
+
     def print_status(self):
         """Stampa un report completo dello stato corrente del Paper Trading."""
         st = self.ledger.state
@@ -440,6 +480,135 @@ class RealnetPaperAgent:
             print("\nPosizione Attiva:   NESSUNA (Stato Flat)")
         print("=" * 65 + "\n")
 
+    def get_telegram_status_report(self) -> str:
+        """Restituisce un report HTML completo dello stato attuale per Telegram."""
+        st = self.ledger.state
+        init_bal = st.get('initial_balance', 100.0)
+        curr_bal = st.get('current_balance', 100.0)
+        tot_pnl = st.get('total_pnl_usdt', 0.0)
+        pnl_pct = ((curr_bal - init_bal) / init_bal) * 100.0 if init_bal else 0.0
+        closed_count = len(st.get('closed_trades', []))
+        win_rate = st.get('win_rate_pct', 0.0)
+        cb_status = "🚨 ATTIVO" if st.get('circuit_breaker_triggered') else "✅ Normale (50$ min)"
+
+        pos = st.get("current_position")
+        if pos:
+            try:
+                live_price = self.get_realtime_ticker()
+            except Exception:
+                live_price = pos["entry_price"]
+
+            direction = pos["direction"]
+            entry_p = pos["entry_price"]
+            ret = (live_price - entry_p)/entry_p if direction == 'LONG' else (entry_p - live_price)/entry_p
+            pnl_flot = pos["size_usdt"] * ret
+
+            entry_time = datetime.fromisoformat(pos["entry_time"])
+            elapsed_h = (datetime.now(timezone.utc) - entry_time).total_seconds() / 3600.0
+            pos_icon = "🟢" if direction == "LONG" else "🔴"
+
+            pos_text = (
+                f"\n📌 <b>Posizione Aperta:</b> {pos_icon} <b>{direction}</b>\n"
+                f"• Entry: <code>{entry_p:.2f} USDT</code>\n"
+                f"• Prezzo Live: <code>{live_price:.2f} USDT</code>\n"
+                f"• PnL Flottante: <b>{pnl_flot:+.2f} USDT ({ret*100:+.2f}%)</b>\n"
+                f"• TP: <code>{pos['tp_price']:.2f}</code> | SL: <code>{pos['sl_price']:.2f}</code>\n"
+                f"• Durata: <code>{elapsed_h:.1f}h / 24h</code>\n"
+            )
+        else:
+            pos_text = "\n📌 <b>Posizione Aperta:</b> ⚪ Nessuna (Stato Flat)\n"
+
+        report = (
+            "📊 <b>REPORT TCN TRADING BOT (AZURE)</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"💵 <b>Saldo Attuale:</b> <code>{curr_bal:.2f} USDT</code>\n"
+            f"📈 <b>PnL Totale:</b> <b>{tot_pnl:+.2f} USDT ({pnl_pct:+.2f}%)</b>\n"
+            f"🏆 <b>Win Rate:</b> <code>{win_rate:.1f}%</code> ({closed_count} trade chiusi)\n"
+            f"🛡 <b>Circuit Breaker:</b> {cb_status}\n"
+            f"{pos_text}"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"⏰ <b>Ora UTC:</b> <code>{datetime.now(timezone.utc).strftime('%H:%M:%S - %d/%m/%Y')}</code>"
+        )
+        return report
+
+    def get_telegram_position_report(self) -> str:
+        """Restituisce dettagli della posizione attualmente attiva per Telegram."""
+        pos = self.ledger.position
+        if not pos:
+            return "⚪ <b>Nessuna posizione attualmente aperta.</b> Il bot è in attesa di un segnale TCN."
+        try:
+            live_price = self.get_realtime_ticker()
+        except Exception:
+            live_price = pos["entry_price"]
+
+        direction = pos["direction"]
+        entry_p = pos["entry_price"]
+        ret = (live_price - entry_p)/entry_p if direction == 'LONG' else (entry_p - live_price)/entry_p
+        pnl_flot = pos["size_usdt"] * ret
+
+        entry_time = datetime.fromisoformat(pos["entry_time"])
+        elapsed_h = (datetime.now(timezone.utc) - entry_time).total_seconds() / 3600.0
+        elapsed_b = elapsed_h / 4.0
+        dir_icon = "🟢" if direction == "LONG" else "🔴"
+
+        return (
+            f"🎯 <b>DETTAGLI POSIZIONE ATTIVA</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"📍 <b>Direzione:</b> {dir_icon} <b>{direction}</b>\n"
+            f"💵 <b>Entry Price:</b> <code>{entry_p:.2f} USDT</code>\n"
+            f"⚡ <b>Prezzo Live:</b> <code>{live_price:.2f} USDT</code>\n"
+            f"📈 <b>PnL Flottante:</b> <b>{pnl_flot:+.2f} USDT ({ret*100:+.2f}%)</b>\n"
+            f"📦 <b>Size:</b> <code>{pos['size_usdt']:.2f} USDT</code>\n"
+            f"🎯 <b>Take Profit:</b> <code>{pos['tp_price']:.2f} USDT</code>\n"
+            f"🛑 <b>Stop Loss:</b> <code>{pos['sl_price']:.2f} USDT</code>\n"
+            f"⏱ <b>Durata:</b> <code>{elapsed_h:.1f} ore ({elapsed_b:.1f}/{self.max_holding} barre 4H)</code>\n"
+            "━━━━━━━━━━━━━━━━━━━━"
+        )
+
+    def get_telegram_balance_report(self) -> str:
+        """Restituisce il bilancio attuale e performance per Telegram."""
+        st = self.ledger.state
+        init_bal = st.get('initial_balance', 100.0)
+        curr_bal = st.get('current_balance', 100.0)
+        tot_pnl = st.get('total_pnl_usdt', 0.0)
+        tot_fees = st.get('total_fees_usdt', 0.0)
+        pnl_pct = ((curr_bal - init_bal) / init_bal) * 100.0 if init_bal else 0.0
+
+        return (
+            "💰 <b>SALDO & PERFORMANCE</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"🏦 <b>Saldo Attuale:</b> <code>{curr_bal:.2f} USDT</code>\n"
+            f"🌱 <b>Capitale Iniziale:</b> <code>{init_bal:.2f} USDT</code>\n"
+            f"📊 <b>Profitto Netto:</b> <b>{tot_pnl:+.2f} USDT ({pnl_pct:+.2f}%)</b>\n"
+            f"🧾 <b>Commissioni Taker:</b> <code>{tot_fees:.2f} USDT</code>\n"
+            "━━━━━━━━━━━━━━━━━━━━"
+        )
+
+    def get_telegram_last_trades_report(self) -> str:
+        """Restituisce lo storico degli ultimi trade conclusi per Telegram."""
+        closed = self.ledger.state.get("closed_trades", [])
+        if not closed:
+            return "📜 <b>Nessun trade chiuso nello storico finora.</b>"
+
+        last_trades = closed[-5:]
+        lines = []
+        for i, t in enumerate(reversed(last_trades), 1):
+            icon = "🟢" if t["direction"] == "LONG" else "🔴"
+            res_icon = "💰" if t["net_pnl_usdt"] >= 0 else "🔻"
+            pnl_str = f"{t['net_pnl_usdt']:+.2f} USDT ({t['net_return_pct']:+.2f}%)"
+            lines.append(
+                f"{res_icon} <b>Trade #{len(closed)-i+1}:</b> {icon} {t['direction']} ({t['reason']})\n"
+                f"   • In: <code>{t['entry_price']:.1f}</code> ➔ Out: <code>{t['exit_price']:.1f}</code>\n"
+                f"   • PnL: <b>{pnl_str}</b> | Durata: <code>{t.get('duration_bars', 0):.1f} barre</code>"
+            )
+
+        return (
+            f"📜 <b>ULTIMI {len(last_trades)} TRADE CONCLUSI:</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            + "\n\n".join(lines)
+            + "\n━━━━━━━━━━━━━━━━━━━━"
+        )
+
 
 def main():
     parser = argparse.ArgumentParser(description="Live Realnet Paper Trading Agent con TCN")
@@ -455,6 +624,18 @@ def main():
         return
 
     if args.loop:
+        # Avvia listener comandi interattivi Telegram se abilitato
+        if agent.config.get("telegram", {}).get("enable_commands", True):
+            agent.telegram.start_command_listener(agent)
+
+        agent.telegram.notify_startup(
+            symbol=agent.symbol,
+            timeframe=agent.timeframe,
+            balance=agent.ledger.balance,
+            interval_min=args.interval,
+            mode=agent.config.get("execution", {}).get("mode", "realnet_paper")
+        )
+
         logger.info(f"Avvio monitoraggio continuo Realnet (controllo ogni {args.interval} minuti). Premi Ctrl+C per fermare.")
         try:
             while True:
@@ -462,6 +643,7 @@ def main():
                 time.sleep(args.interval * 60)
         except KeyboardInterrupt:
             logger.info("Monitoraggio interrotto dall'utente.")
+            agent.telegram.stop_command_listener()
     else:
         # Singola valutazione istantanea
         agent.evaluate()

@@ -59,3 +59,13 @@ execution:
   use_dynamic_atr_targets: true    # Usa le barriere vincenti dell'Exp 2 (2.2 ATR TP / 1.4 ATR SL)
   atr_multiplier_target: 2.2
   atr_multiplier_sl: 1.4
+
+telegram:
+  enabled: true
+  bot_token: ""               # Se vuoto, caricato da .env / TELEGRAM_BOT_TOKEN
+  chat_id: ""                 # Se vuoto, caricato da .env / TELEGRAM_CHAT_ID
+  notify_on_start: true       # Notifica all'avvio del monitoraggio
+  notify_on_trade: true       # Notifica immediata di apertura trade
+  notify_on_close: true       # Notifica di chiusura trade (TP/SL/Time)
+  notify_on_circuit_breaker: true
+  enable_commands: true       # Ascolto comandi interattivi (/status, /pos, /balance, /last, /ping)

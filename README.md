@@ -171,6 +171,34 @@ Per far girare il bot in paper trading continuo per giorni senza dover tenere il
 
 ---
 
+### 6. Monitoraggio Remoto via Telegram Bot (@Trading_furo_bot) 📱
+Per monitorare il bot in esecuzione su Azure senza dover aprire la console SSH o il portale:
+
+1. **Configurazione credenziali**:
+   Crea o aggiorna il file `.env` nella root del progetto:
+   ```env
+   TELEGRAM_BOT_TOKEN=your_telegram_bot_token_here
+   TELEGRAM_CHAT_ID=your_chat_id_here
+   TELEGRAM_ENABLED=true
+   ```
+
+2. **Notifiche Push Automatiche**:
+   - 🟢/🔴 **Apertura Trade**: Direzione, Entry Price, Size in USDT, Take Profit e Stop Loss ATR, probabilità predittive della TCN.
+   - 🎯/🛑 **Chiusura Trade**: Motivo (Take Profit, Stop Loss, Time Stop a 24h), prezzo di uscita, PnL netto $, nuovo saldo e Win Rate.
+   - 🚨 **Circuit Breaker**: Allarme istantaneo se il saldo scende sotto la soglia di salvaguardia (50 USDT).
+   - 🚀 **Avvio Bot**: Conferma di avvio con parametri attivi e intervallo di loop.
+
+3. **Comandi Interattivi da Smartphone (Chat Telegram)**:
+   Mentre il bot gira con `--loop` su Azure, puoi inviare in qualsiasi momento:
+   - `/status` — Report completo su saldo, profitto totale, win rate e dettagli della posizione aperta.
+   - `/pos` — Dettagli in tempo reale della posizione attiva (prezzo live, PnL flottante, distanza da TP/SL).
+   - `/balance` — Saldo virtuale corrente, performance % e fee complessive pagate.
+   - `/last` — Storico degli ultimi 5 trade chiusi con esito e guadagno netto.
+   - `/ping` — Risposta istantanea di verifica liveness dal server Azure.
+   - `/help` — Riepilogo comandi disponibili.
+
+---
+
 ## ⚙️ Parametri Principali (`config/config.yaml`)
 
 | Sezione | Parametro | Descrizione |
