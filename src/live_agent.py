@@ -344,32 +344,68 @@ class RealnetPaperAgent:
 
         exit_reason = None
         exit_price = current_price
-        if direction == "LONG":
-            if high_reach >= pos["tp_price"] and low_reach <= pos["sl_price"]:
-                exit_reason = "STOP_LOSS"
-                exit_price = pos["sl_price"]
-            elif low_reach <= pos["sl_price"]:
-                exit_reason = "STOP_LOSS"
-                exit_price = pos["sl_price"]
-            elif high_reach >= pos["tp_price"]:
-                exit_reason = "TAKE_PROFIT"
-                exit_price = pos["tp_price"]
-            elif is_time_stop:
-                exit_reason = "TIME_STOP"
-                exit_price = current_price
-        else: # SHORT
-            if low_reach <= pos["tp_price"] and high_reach >= pos["sl_price"]:
-                exit_reason = "STOP_LOSS"
-                exit_price = pos["sl_price"]
-            elif high_reach >= pos["sl_price"]:
-                exit_reason = "STOP_LOSS"
-                exit_price = pos["sl_price"]
-            elif low_reach <= pos["tp_price"]:
-                exit_reason = "TAKE_PROFIT"
-                exit_price = pos["tp_price"]
-            elif is_time_stop:
-                exit_reason = "TIME_STOP"
-                exit_price = current_price
+
+        # Ispezione cronologica minuto per minuto: determina esattamente quale livello scatta per primo nel tempo
+        sorted_candles = sorted(candles_1m, key=lambda c: c[0]) if candles_1m else []
+        for c in sorted_candles:
+            c_high = c[2]
+            c_low = c[3]
+
+            if direction == "LONG":
+                hit_tp = c_high >= pos["tp_price"]
+                hit_sl = c_low <= pos["sl_price"]
+                if hit_tp and hit_sl:
+                    # Entrambi toccati nello stesso singolo minuto: approccio prudenziale a SL
+                    exit_reason = "STOP_LOSS"
+                    exit_price = pos["sl_price"]
+                    break
+                elif hit_tp:
+                    exit_reason = "TAKE_PROFIT"
+                    exit_price = pos["tp_price"]
+                    break
+                elif hit_sl:
+                    exit_reason = "STOP_LOSS"
+                    exit_price = pos["sl_price"]
+                    break
+            else: # SHORT
+                hit_tp = c_low <= pos["tp_price"]
+                hit_sl = c_high >= pos["sl_price"]
+                if hit_tp and hit_sl:
+                    # Entrambi toccati nello stesso singolo minuto: approccio prudenziale a SL
+                    exit_reason = "STOP_LOSS"
+                    exit_price = pos["sl_price"]
+                    break
+                elif hit_tp:
+                    exit_reason = "TAKE_PROFIT"
+                    exit_price = pos["tp_price"]
+                    break
+                elif hit_sl:
+                    exit_reason = "STOP_LOSS"
+                    exit_price = pos["sl_price"]
+                    break
+
+        # Se nessuna candela a 1m ha toccato i target, verifica il tick corrente o il Time Stop a 24h
+        if not exit_reason:
+            if direction == "LONG":
+                if current_price >= pos["tp_price"]:
+                    exit_reason = "TAKE_PROFIT"
+                    exit_price = pos["tp_price"]
+                elif current_price <= pos["sl_price"]:
+                    exit_reason = "STOP_LOSS"
+                    exit_price = pos["sl_price"]
+                elif is_time_stop:
+                    exit_reason = "TIME_STOP"
+                    exit_price = current_price
+            else: # SHORT
+                if current_price <= pos["tp_price"]:
+                    exit_reason = "TAKE_PROFIT"
+                    exit_price = pos["tp_price"]
+                elif current_price >= pos["sl_price"]:
+                    exit_reason = "STOP_LOSS"
+                    exit_price = pos["sl_price"]
+                elif is_time_stop:
+                    exit_reason = "TIME_STOP"
+                    exit_price = current_price
 
         if exit_reason:
             self._close_trade(pos, exit_price, exit_reason)
