@@ -639,7 +639,16 @@ def main():
         logger.info(f"Avvio monitoraggio continuo Realnet (controllo ogni {args.interval} minuti). Premi Ctrl+C per fermare.")
         try:
             while True:
-                agent.evaluate()
+                # Auto-recovery: assicura che il listener Telegram sia sempre attivo
+                if agent.config.get("telegram", {}).get("enable_commands", True):
+                    agent.telegram.ensure_listener_running(agent)
+
+                try:
+                    agent.evaluate()
+                except Exception as e:
+                    logger.error(f"❌ Errore imprevisto durante il ciclo di valutazione: {e}", exc_info=True)
+                    agent.telegram.notify_error(f"Errore ciclo di valutazione: {e}")
+
                 time.sleep(args.interval * 60)
         except KeyboardInterrupt:
             logger.info("Monitoraggio interrotto dall'utente.")

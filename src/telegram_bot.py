@@ -9,12 +9,29 @@ import requests
 logger = logging.getLogger(__name__)
 
 
-def load_env_file(env_path: str = ".env"):
+def load_env_file(env_path: Optional[str] = None):
     """Carica variabili chiave da un file .env se presente, senza richiedere dipendenze esterne."""
-    if not os.path.exists(env_path):
+    candidate_paths = []
+    if env_path:
+        candidate_paths.append(env_path)
+
+    # Root del progetto (directory genitore di 'src')
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    candidate_paths.append(os.path.join(base_dir, ".env"))
+    candidate_paths.append(os.path.join(os.getcwd(), ".env"))
+    candidate_paths.append(".env")
+
+    found_path = None
+    for p in candidate_paths:
+        if os.path.isfile(p):
+            found_path = p
+            break
+
+    if not found_path:
         return
+
     try:
-        with open(env_path, "r") as f:
+        with open(found_path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line or line.startswith("#") or "=" not in line:
@@ -25,7 +42,7 @@ def load_env_file(env_path: str = ".env"):
                 if k not in os.environ:
                     os.environ[k] = v
     except Exception as e:
-        logger.warning(f"Errore durante la lettura del file .env ({e})")
+        logger.warning(f"Errore durante la lettura del file .env da {found_path} ({e})")
 
 
 class TelegramNotifier:
@@ -211,26 +228,50 @@ class TelegramNotifier:
         )
         self.send_message(msg)
 
+    def is_listener_alive(self) -> bool:
+        """Verifica se il thread di ascolto comandi Telegram è attualmente in esecuzione."""
+        return self._polling_thread is not None and self._polling_thread.is_alive()
+
+    def ensure_listener_running(self, agent: Any):
+        """Riavvia automaticamente il thread di polling se è terminato o non avviato."""
+        if not self.enabled:
+            return
+        if not self.is_listener_alive():
+            logger.warning("🔄 Thread TelegramListener non attivo, riavvio in corso...")
+            self.start_command_listener(agent)
+
     def start_command_listener(self, agent: Any):
         """
         Avvia un thread in background per ascoltare i comandi inviati su Telegram
         e rispondere in tempo reale.
         """
         if not self.enabled:
+            logger.warning("⚠️ Impossibile avviare listener: Notificatore Telegram disabilitato o non configurato.")
             return
 
         def _polling_loop():
             offset = 0
             logger.info("📡 In ascolto comandi Telegram (/status, /pos, /balance, /last, /ping)...")
+            consecutive_errors = 0
             while not self._stop_polling.is_set():
                 try:
                     url = f"{self.base_url}/getUpdates"
                     params = {"offset": offset, "timeout": 20}
-                    resp = requests.get(url, params=params, timeout=25)
-                    if resp.status_code != 200:
-                        time.sleep(3)
+                    resp = requests.get(url, params=params, timeout=(10, 25))
+
+                    if resp.status_code == 409:
+                        logger.error(
+                            "⚠️ Errore Telegram HTTP 409 Conflict: un'altra istanza del bot sta eseguendo getUpdates! "
+                            "Assicurati che non vi siano processi duplicati su Azure o in locale."
+                        )
+                        time.sleep(10)
+                        continue
+                    elif resp.status_code != 200:
+                        logger.warning(f"⚠️ Telegram polling fallito (HTTP {resp.status_code}): {resp.text}")
+                        time.sleep(5)
                         continue
 
+                    consecutive_errors = 0
                     data = resp.json()
                     for update in data.get("result", []):
                         offset = update["update_id"] + 1
@@ -243,15 +284,25 @@ class TelegramNotifier:
 
                         # Filtra solo comandi dal proprietario autorizzato
                         if sender_id != self.chat_id:
-                            logger.warning(f"Ricevuto messaggio da utente non autorizzato: {sender_id}")
+                            logger.warning(f"Ricevuto messaggio da utente non autorizzato: {sender_id} (atteso: {self.chat_id})")
                             continue
 
-                        self._handle_command(text, agent)
+                        try:
+                            self._handle_command(text, agent)
+                        except Exception as cmd_err:
+                            logger.error(f"Errore durante l'esecuzione del comando Telegram '{text}': {cmd_err}", exc_info=True)
+                            self.send_message(f"⚠️ Errore interno durante l'elaborazione del comando: <code>{cmd_err}</code>")
+
                 except requests.exceptions.Timeout:
                     continue
+                except requests.exceptions.RequestException as e:
+                    consecutive_errors += 1
+                    sleep_time = min(30, 2 * consecutive_errors)
+                    logger.warning(f"⚠️ Errore di rete Telegram ({e}). Riprovo tra {sleep_time}s...")
+                    time.sleep(sleep_time)
                 except Exception as e:
-                    logger.debug(f"Eccezione temporanea polling Telegram: {e}")
-                    time.sleep(3)
+                    logger.error(f"❌ Eccezione imprevista nel polling Telegram: {e}", exc_info=True)
+                    time.sleep(5)
 
         self._stop_polling.clear()
         self._polling_thread = threading.Thread(target=_polling_loop, daemon=True, name="TelegramListener")
@@ -272,24 +323,24 @@ class TelegramNotifier:
         if cmd in ["/start", "/help"]:
             reply = (
                 "🤖 <b>Trading Bot TCN - Comandi Disponibili:</b>\n\n"
-                "📊 /status - Report completo stato, saldo e posizioni\n"
-                "🎯 /pos - Dettagli della posizione attiva (se presente)\n"
-                "💵 /balance - Saldo attuale e performance %\n"
+                "📊 /status (o /stato) - Report completo stato, saldo e posizioni\n"
+                "🎯 /pos (o /positions) - Dettagli della posizione attiva (se presente)\n"
+                "💵 /balance (o /saldo) - Saldo attuale e performance %\n"
                 "📜 /last - Ultimi trade chiusi\n"
                 "🏓 /ping - Verifica se il bot su Azure è vivo\n"
                 "ℹ️ /help - Mostra questa guida"
             )
             self.send_message(reply)
 
-        elif cmd == "/status":
+        elif cmd in ["/status", "/stato"]:
             reply = agent.get_telegram_status_report()
             self.send_message(reply)
 
-        elif cmd in ["/pos", "/position"]:
+        elif cmd in ["/pos", "/position", "/positions"]:
             reply = agent.get_telegram_position_report()
             self.send_message(reply)
 
-        elif cmd in ["/balance", "/saldo"]:
+        elif cmd in ["/balance", "/saldo", "/bal"]:
             reply = agent.get_telegram_balance_report()
             self.send_message(reply)
 
@@ -304,3 +355,36 @@ class TelegramNotifier:
 
         else:
             self.send_message("❓ Comando non riconosciuto. Invia /help per la lista comandi.")
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Test diagnostico del Bot Telegram")
+    parser.add_argument("--test", action="store_true", help="Esegue test di connessione e invio ping")
+    args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    notifier = TelegramNotifier()
+    print("--- Diagnostica Telegram ---")
+    print(f"Abilitato:    {notifier.enabled}")
+    print(f"Token Config: {'Presente' if notifier.token else 'MANCANTE'}")
+    print(f"Chat ID:      {notifier.chat_id or 'MANCANTE'}")
+
+    if notifier.enabled:
+        # Test getMe
+        try:
+            r = requests.get(f"{notifier.base_url}/getMe", timeout=10)
+            bot_info = r.json().get("result", {})
+            print(f"Bot Username: @{bot_info.get('username')}")
+            print(f"API Online:   {r.status_code == 200}")
+        except Exception as e:
+            print(f"Errore connessione API: {e}")
+
+        if args.test:
+            print("Invio messaggio di prova...")
+            success = notifier.send_message("🏓 <b>Test Diagnostico Telegram Bot TCN</b>\nConnessione e autorizzazioni verificate con successo!")
+            print(f"Esito invio: {'SUCCESSO' if success else 'FALLITO'}")
+    else:
+        print("\n⚠️ Per abilitare il bot, crea o aggiorna il file .env con:")
+        print("TELEGRAM_BOT_TOKEN=your_telegram_bot_token_here")
+        print("TELEGRAM_CHAT_ID=your_chat_id_here")
