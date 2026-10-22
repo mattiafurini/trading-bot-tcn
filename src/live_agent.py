@@ -5,6 +5,7 @@ import json
 import logging
 import argparse
 from datetime import datetime, timezone
+import threading
 from typing import Dict, Any, Optional
 
 # Assicura che la root del progetto sia in sys.path
@@ -107,6 +108,7 @@ class RealnetPaperAgent:
         init_bal = self.config["execution"].get("initial_paper_balance", 100.0)
         cb_min = self.config["execution"].get("circuit_breaker_min_balance", 50.0)
         self.ledger = PaperTradingLedger(initial_balance=init_bal, circuit_breaker_min=cb_min)
+        self._lock = threading.Lock()
 
         # Inizializza Scaler
         logger.info(f"Caricamento Scaler da {scaler_path}...")
@@ -309,7 +311,10 @@ class RealnetPaperAgent:
 
         # Recupera candele a 1 minuto per catturare ombre/spike senza perdere opportunità
         now_ms = self.exchange.milliseconds()
-        last_check_ms = pos.get("last_check_ms", now_ms - (15 * 60 * 1000))
+        fallback_since = now_ms - (15 * 60 * 1000)
+        last_check_ms = pos.get("last_check_ms", fallback_since)
+        if now_ms - last_check_ms > 100 * 60 * 1000:
+            last_check_ms = fallback_since
         pos["last_check_ms"] = now_ms
 
         high_reach = current_price
@@ -317,8 +322,8 @@ class RealnetPaperAgent:
         try:
             candles_1m = self.exchange.fetch_ohlcv(f"{self.symbol}:USDT", timeframe="1m", since=last_check_ms, limit=100)
             if candles_1m:
-                high_reach = max(c[2] for c in candles_1m)
-                low_reach = min(c[3] for c in candles_1m)
+                high_reach = max(high_reach, max(c[2] for c in candles_1m))
+                low_reach = min(low_reach, min(c[3] for c in candles_1m))
         except Exception as e:
             logger.warning(f"Impossibile scaricare candele 1m ({e}), uso prezzo istantaneo.")
 
@@ -481,65 +486,67 @@ class RealnetPaperAgent:
         print("=" * 65 + "\n")
 
     def get_telegram_status_report(self) -> str:
-        """Restituisce un report HTML completo dello stato attuale per Telegram."""
-        st = self.ledger.state
-        init_bal = st.get('initial_balance', 100.0)
-        curr_bal = st.get('current_balance', 100.0)
-        tot_pnl = st.get('total_pnl_usdt', 0.0)
-        pnl_pct = ((curr_bal - init_bal) / init_bal) * 100.0 if init_bal else 0.0
-        closed_count = len(st.get('closed_trades', []))
-        win_rate = st.get('win_rate_pct', 0.0)
-        cb_status = "🚨 ATTIVO" if st.get('circuit_breaker_triggered') else "✅ Normale (50$ min)"
+        """Restituisce un report HTML completo dello stato attuale per Telegram (sola lettura)."""
+        with self._lock:
+            st = self.ledger.state
+            init_bal = st.get('initial_balance', 100.0)
+            curr_bal = st.get('current_balance', 100.0)
+            tot_pnl = st.get('total_pnl_usdt', 0.0)
+            pnl_pct = ((curr_bal - init_bal) / init_bal) * 100.0 if init_bal else 0.0
+            closed_count = len(st.get('closed_trades', []))
+            win_rate = st.get('win_rate_pct', 0.0)
+            cb_status = "🚨 ATTIVO" if st.get('circuit_breaker_triggered') else "✅ Normale (50$ min)"
 
-        pos = st.get("current_position")
-        if pos:
+            pos = st.get("current_position")
+            if pos:
+                try:
+                    live_price = self.get_realtime_ticker()
+                except Exception:
+                    live_price = pos["entry_price"]
+
+                direction = pos["direction"]
+                entry_p = pos["entry_price"]
+                ret = (live_price - entry_p)/entry_p if direction == 'LONG' else (entry_p - live_price)/entry_p
+                pnl_flot = pos["size_usdt"] * ret
+
+                entry_time = datetime.fromisoformat(pos["entry_time"])
+                elapsed_h = (datetime.now(timezone.utc) - entry_time).total_seconds() / 3600.0
+                pos_icon = "🟢" if direction == "LONG" else "🔴"
+
+                pos_text = (
+                    f"\n📌 <b>Posizione Aperta:</b> {pos_icon} <b>{direction}</b>\n"
+                    f"• Entry: <code>{entry_p:.2f} USDT</code>\n"
+                    f"• Prezzo Live: <code>{live_price:.2f} USDT</code>\n"
+                    f"• PnL Flottante: <b>{pnl_flot:+.2f} USDT ({ret*100:+.2f}%)</b>\n"
+                    f"• TP: <code>{pos['tp_price']:.2f}</code> | SL: <code>{pos['sl_price']:.2f}</code>\n"
+                    f"• Durata: <code>{elapsed_h:.1f}h / 24h</code>\n"
+                )
+            else:
+                pos_text = "\n📌 <b>Posizione Aperta:</b> ⚪ Nessuna (Stato Flat)\n"
+
+            report = (
+                "📊 <b>REPORT TCN TRADING BOT (AZURE)</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"💵 <b>Saldo Attuale:</b> <code>{curr_bal:.2f} USDT</code>\n"
+                f"📈 <b>PnL Totale:</b> <b>{tot_pnl:+.2f} USDT ({pnl_pct:+.2f}%)</b>\n"
+                f"🏆 <b>Win Rate:</b> <code>{win_rate:.1f}%</code> ({closed_count} trade chiusi)\n"
+                f"🛡 <b>Circuit Breaker:</b> {cb_status}\n"
+                f"{pos_text}"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"⏰ <b>Ora UTC:</b> <code>{datetime.now(timezone.utc).strftime('%H:%M:%S - %d/%m/%Y')}</code>"
+            )
+            return report
+
+    def get_telegram_position_report(self) -> str:
+        """Restituisce dettagli della posizione attualmente attiva per Telegram (sola lettura)."""
+        with self._lock:
+            pos = self.ledger.position
+            if not pos:
+                return "⚪ <b>Nessuna posizione attualmente aperta.</b> Il bot è in attesa di un segnale TCN."
             try:
                 live_price = self.get_realtime_ticker()
             except Exception:
                 live_price = pos["entry_price"]
-
-            direction = pos["direction"]
-            entry_p = pos["entry_price"]
-            ret = (live_price - entry_p)/entry_p if direction == 'LONG' else (entry_p - live_price)/entry_p
-            pnl_flot = pos["size_usdt"] * ret
-
-            entry_time = datetime.fromisoformat(pos["entry_time"])
-            elapsed_h = (datetime.now(timezone.utc) - entry_time).total_seconds() / 3600.0
-            pos_icon = "🟢" if direction == "LONG" else "🔴"
-
-            pos_text = (
-                f"\n📌 <b>Posizione Aperta:</b> {pos_icon} <b>{direction}</b>\n"
-                f"• Entry: <code>{entry_p:.2f} USDT</code>\n"
-                f"• Prezzo Live: <code>{live_price:.2f} USDT</code>\n"
-                f"• PnL Flottante: <b>{pnl_flot:+.2f} USDT ({ret*100:+.2f}%)</b>\n"
-                f"• TP: <code>{pos['tp_price']:.2f}</code> | SL: <code>{pos['sl_price']:.2f}</code>\n"
-                f"• Durata: <code>{elapsed_h:.1f}h / 24h</code>\n"
-            )
-        else:
-            pos_text = "\n📌 <b>Posizione Aperta:</b> ⚪ Nessuna (Stato Flat)\n"
-
-        report = (
-            "📊 <b>REPORT TCN TRADING BOT (AZURE)</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            f"💵 <b>Saldo Attuale:</b> <code>{curr_bal:.2f} USDT</code>\n"
-            f"📈 <b>PnL Totale:</b> <b>{tot_pnl:+.2f} USDT ({pnl_pct:+.2f}%)</b>\n"
-            f"🏆 <b>Win Rate:</b> <code>{win_rate:.1f}%</code> ({closed_count} trade chiusi)\n"
-            f"🛡 <b>Circuit Breaker:</b> {cb_status}\n"
-            f"{pos_text}"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            f"⏰ <b>Ora UTC:</b> <code>{datetime.now(timezone.utc).strftime('%H:%M:%S - %d/%m/%Y')}</code>"
-        )
-        return report
-
-    def get_telegram_position_report(self) -> str:
-        """Restituisce dettagli della posizione attualmente attiva per Telegram."""
-        pos = self.ledger.position
-        if not pos:
-            return "⚪ <b>Nessuna posizione attualmente aperta.</b> Il bot è in attesa di un segnale TCN."
-        try:
-            live_price = self.get_realtime_ticker()
-        except Exception:
-            live_price = pos["entry_price"]
 
         direction = pos["direction"]
         entry_p = pos["entry_price"]
