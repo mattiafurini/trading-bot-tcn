@@ -41,25 +41,46 @@ def add_code(source: str):
         "source": [line + "\n" for line in source.strip().splitlines()]
     })
 
-# Cell 1: Intro
-add_md("""# 🔬 Quantitative TCN Trading Bot: Multi-Experiment Optimization Suite
-### Rigorous Empirical Research & Profit Maximization on BTC/USDT 4H Perpetual Futures
+# =====================================================================
+# Cell 1: Intro Markdown
+# =====================================================================
+add_md("""# 🛡️ Quantitative TCN Trading Bot: Anti-Chop & False Breakout Filter Suite
+### Robust Dynamic ATR Trading on BTC/USDT 4H Perpetual Futures
 
-Questo notebook esegue in successione automatica i **3 esperimenti chiave** per ottimizzare l'aspettativa matematica ($EV$) ed elevare il profitto riducendo il rischio di *backtest overfitting*:
+Questo notebook valuta la configurazione vincente **Dynamic ATR** sui 3 macro-periodi storici (2022 Bear, 2024 Bull, 2025-2026 Recente) confrontando la versione Standard con i filtri Anti-Chop per proteggere il capitale nelle fasi laterali:
 
-1. **Esperimento 1 — Grid Search su Validation Set:** Confronta 3 configurazioni di regolarizzazione (`learning_rate`, `dropout`, `weight_decay`) e seleziona oggettivamente la vincente su `val_loss` e `val_f1`.
-2. **Esperimento 2 — Dynamic ATR Volatility Barriers:** Rimpiazza le percentuali fisse con barriere adattive basate sull'Average True Range per seguire la volatilità di mercato ($2.2 \times ATR$ e $1.4 \times ATR$).
-3. **Esperimento 3 — Deep Ensemble Consensus (5-TCN Multi-Seed Bagging):** Addestra 5 reti TCN indipendenti con semi casuali differenti (`[42, 101, 777, 1337, 2024]`), aggrega le probabilità predittive via soft-voting ensemble per cancellare la varianza stocastica ed elevare Sharpe Ratio e stabilità.
-4. **Tabella Comparativa Finale & Champion Export:** Grafico multi-equity curve a confronto e salvataggio sia dell'ensemble `tcn_ensemble.pth` che del modello singolo `tcn_best_model.pth`.
+---
+
+### 🎛️ Le 4 Configurazioni a Confronto:
+1. **1. Standard (Benchmark di Controllo):**
+   * `P(dir) >= 0.38`, `Ratio >= 1.25`, nessun filtro volatilità.
+2. **2. Anti-Chop Confidenza (0.42 / 1.30):**
+   * `P(dir) >= 0.42`, `Ratio >= 1.30`.
+   * Esige che il modello abbia forte convinzione direzionale ($P \ge 42\%$) e un distacco del 30% rispetto all'opposto, tagliando i trade di rumore e proteggendo il capitale.
+3. **3. Anti-Chop Ibrido (Confidence + Volatility Gate):**
+   * `P(dir) >= 0.42`, `Ratio >= 1.30` + `norm_atr >= 0.010` (1.0% min).
+4. **4. Anti-Chop Sniper (High-Conviction Breakout):**
+   * `P(dir) >= 0.45`, `Ratio >= 1.35` + `norm_atr >= 0.011` (1.1% min).
+
+---
+
+### 📅 Valutazione sui 3 Macro-Periodi Storici:
+* **Periodo 1 (2022 Bear):** Test di resistenza sul crollo di BTC da 48k a 16k.
+* **Periodo 2 (2024 Bull):** Test di cattura del rally da 40k a 95k+.
+* **Periodo 3 (2025-2026 Recente):** Valutazione sulle condizioni contemporanee.
 """)
 
+# =====================================================================
 # Cell 2: Dependencies
+# =====================================================================
 add_code("""# 1. Installazione dipendenze minime
 !pip install ccxt pyyaml --quiet
 print("Ambiente configurato con successo!")
 """)
 
-# Cell 3: Imports & Global Setup
+# =====================================================================
+# Cell 3: Imports & Global Configuration
+# =====================================================================
 add_code("""# 2. Import delle librerie e configurazione base
 import os
 import glob
@@ -79,7 +100,7 @@ from sklearn.metrics import classification_report, f1_score, precision_score, co
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import TensorDataset, DataLoader
 
 def set_seed(seed=42):
     np.random.seed(seed)
@@ -92,15 +113,15 @@ set_seed(42)
 BASE_CONFIG = {
     "symbol": "BTC/USDT",
     "timeframe": "4h",
-    "lookback_window": 64,
-    "prediction_horizon": 6,       # 24 ore holding
-    "taker_fee": 0.0005,           # 0.05% taker
-    "embargo_bars": 12,            # 48 ore anti-leakage
+    "lookback_window": 64,         # 64 barre 4H (~10.6 giorni)
+    "prediction_horizon": 6,       # 6 barre = 24 ore di orizzonte
+    "taker_fee": 0.0005,           # 0.05% taker (0.10% round-trip)
+    "embargo_bars": 12,            # 12 barre = 48 ore anti-leakage ai confini
     "batch_size": 64,
-    "channels": [32, 32, 48, 48, 64], # ~65k parametri
+    "channels": [32, 32, 48, 48, 64], # ~55k parametri
     "kernel_size": 3,
-    "max_epochs": 40,
-    "patience": 10
+    "max_epochs": 30,
+    "patience": 8
 }
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -109,10 +130,24 @@ if torch.cuda.is_available():
     print(f"GPU rilevata: {torch.cuda.get_device_name(0)}")
 """)
 
+# =====================================================================
 # Cell 4: Data Loader
+# =====================================================================
 add_code("""# 3. Caricamento dati storici OHLCV
 def load_market_data():
     search_dirs = ["/kaggle/input", "data", "."]
+    for d in search_dirs:
+        if os.path.exists(d):
+            for root, _, files in os.walk(d):
+                for f in files:
+                    if f.endswith(".parquet") and ("BTC" in f or "btc" in f):
+                        file_path = os.path.join(root, f)
+                        print(f"Caricamento dataset: {file_path}")
+                        df = pd.read_parquet(file_path)
+                        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+                        print(f"Caricate {len(df)} barre da {df['timestamp'].iloc[0]} a {df['timestamp'].iloc[-1]}")
+                        return df
+
     for d in search_dirs:
         if os.path.exists(d):
             for root, _, files in os.walk(d):
@@ -121,10 +156,9 @@ def load_market_data():
                         file_path = os.path.join(root, f)
                         print(f"Caricamento dataset: {file_path}")
                         df = pd.read_parquet(file_path)
-                        print(f"Caricate con successo {len(df)} barre da {df['timestamp'].iloc[0]} a {df['timestamp'].iloc[-1]}")
+                        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
                         return df
 
-    # Fallback se non in input
     try:
         import ccxt
         exchange = ccxt.binance({"enableRateLimit": True, "options": {"defaultType": "future"}})
@@ -142,11 +176,15 @@ def load_market_data():
         raise RuntimeError("Carica il file BTC_USDT_4h.parquet negli input di Kaggle!") from e
 
 df_raw = load_market_data()
+print("Distribuzione annuale barre:")
+print(df_raw["timestamp"].dt.year.value_counts().sort_index())
 df_raw.head(3)
 """)
 
+# =====================================================================
 # Cell 5: Features & Scaling
-add_code("""# 4. Feature Engineering Stazionaria
+# =====================================================================
+add_code("""# 4. Feature Engineering Stazionaria & Scaler Anti-Leakage
 FEATURE_COLUMNS = [
     "ret_close", "ret_high", "ret_low", "hl_spread",
     "norm_atr", "vol_vs_sma", "ret_volume",
@@ -176,6 +214,8 @@ def extract_features(df):
     df["dist_sma_50_200"] = (sma50 - sma200) / (sma200 + 1e-8)
     if "funding_rate" not in df.columns:
         df["funding_rate"] = 0.0
+    else:
+        df["funding_rate"] = df["funding_rate"].fillna(0.0)
     df.dropna(subset=FEATURE_COLUMNS, inplace=True)
     df.reset_index(drop=True, inplace=True)
     return df
@@ -184,33 +224,35 @@ class FeatureScaler:
     def __init__(self):
         self.scaler = RobustScaler()
         self.clip_bounds = {}
+        self.feature_names = FEATURE_COLUMNS
         
     def fit(self, df):
-        X = df[FEATURE_COLUMNS].copy()
-        for col in FEATURE_COLUMNS:
+        X = df[self.feature_names].copy()
+        for col in self.feature_names:
             self.clip_bounds[col] = (X[col].quantile(0.01), X[col].quantile(0.99))
             X[col] = X[col].clip(lower=self.clip_bounds[col][0], upper=self.clip_bounds[col][1])
         self.scaler.fit(X.values)
         return self
 
     def transform(self, df):
-        X = df[FEATURE_COLUMNS].copy()
-        for col in FEATURE_COLUMNS:
-            X[col] = X[col].clip(lower=self.clip_bounds[col][0], upper=self.clip_bounds[col][1])
+        X = df[self.feature_names].copy()
+        for col in self.feature_names:
+            if col in self.clip_bounds:
+                X[col] = X[col].clip(lower=self.clip_bounds[col][0], upper=self.clip_bounds[col][1])
         return self.scaler.transform(X.values)
 
 df_features = extract_features(df_raw)
-print(f"Feature estratte: {len(df_features)} barre.")
+print(f"Feature estratte: {len(df_features)} barre stazionarie.")
+print(f"Statistiche Volatilità norm_atr: Mediana={df_features['norm_atr'].median()*100:.2f}% | 25% Quantile={df_features['norm_atr'].quantile(0.25)*100:.2f}% | 10% Quantile={df_features['norm_atr'].quantile(0.10)*100:.2f}%")
 """)
 
-# Cell 6: Triple Barrier Function (Fixed & Dynamic ATR)
-add_code("""# 5. Triple Barrier Labeling (Fisso o Adattivo ad ATR)
+# =====================================================================
+# Cell 6: Triple Barrier Dynamic ATR Labeling
+# =====================================================================
+add_code("""# 5. Triple Barrier Dynamic ATR Labeling (Architettura Vincente)
 def apply_triple_barrier(
     df,
     horizon=6,
-    tp_pct=0.020,
-    sl_pct=0.014,
-    use_dynamic_atr=False,
     atr_mult_tp=2.2,
     atr_mult_sl=1.4,
     taker_fee=0.0005
@@ -225,12 +267,8 @@ def apply_triple_barrier(
 
     for t in range(n - horizon):
         p0 = closes[t]
-        if use_dynamic_atr:
-            target_tp = max(0.015, atrs[t] * atr_mult_tp)
-            target_sl = max(0.010, atrs[t] * atr_mult_sl)
-        else:
-            target_tp = tp_pct
-            target_sl = sl_pct
+        target_tp = max(0.015, atrs[t] * atr_mult_tp)
+        target_sl = max(0.010, atrs[t] * atr_mult_sl)
 
         long_tp = p0 * (1.0 + target_tp + fee)
         long_sl = p0 * (1.0 - target_sl - fee)
@@ -242,7 +280,7 @@ def apply_triple_barrier(
         for k in range(1, horizon + 1):
             h, l = highs[t + k], lows[t + k]
             if h >= long_tp and l <= long_sl:
-                break # Worst case conflitto
+                break
             elif l <= long_sl:
                 break
             elif h >= long_tp:
@@ -271,29 +309,16 @@ def apply_triple_barrier(
     df_out = df.copy()
     df_out["label"] = labels
     return df_out.iloc[:-horizon].copy().reset_index(drop=True)
+
+print("Generazione dataset con label dinamiche ATR (2.2 TP / 1.4 SL)...")
+df_labeled_atr = apply_triple_barrier(df_features, horizon=6, atr_mult_tp=2.2, atr_mult_sl=1.4)
+print(f"Distribuzione label: Neutral={np.mean(df_labeled_atr['label']==0)*100:.1f}% | Long={np.mean(df_labeled_atr['label']==1)*100:.1f}% | Short={np.mean(df_labeled_atr['label']==2)*100:.1f}%")
 """)
 
-# Cell 7: Dataset & Model definition
-add_code("""# 6. PyTorch Dataset & Causal TCN Architecture
-class TimeSeriesDataset(Dataset):
-    def __init__(self, features, labels=None, lookback=64):
-        self.features = features.astype(np.float32)
-        self.labels = labels.astype(np.int64) if labels is not None else None
-        self.lookback = lookback
-        self.n_samples = len(features) - lookback + 1
-
-    def __len__(self):
-        return self.n_samples
-
-    def __getitem__(self, idx):
-        window = self.features[idx : idx + self.lookback]
-        x_tensor = torch.tensor(window.T, dtype=torch.float32)
-        if self.labels is not None:
-            target_idx = idx + self.lookback - 1
-            y_tensor = torch.tensor(self.labels[target_idx], dtype=torch.long)
-            return x_tensor, y_tensor
-        return x_tensor, torch.tensor(-1, dtype=torch.long)
-
+# =====================================================================
+# Cell 7: Causal TCN Architecture
+# =====================================================================
+add_code("""# 6. Architettura TCN Causale
 class CausalConv1d(nn.Module):
     def __init__(self, in_ch, out_ch, kernel_size, dilation=1):
         super().__init__()
@@ -355,60 +380,86 @@ class TemporalConvolutionalNetwork(nn.Module):
         self.eval()
         with torch.no_grad():
             return F.softmax(self.forward(x), dim=-1)
-
-class EnsembleTCN(nn.Module):
-    \"\"\"Deep Ensemble di N TCN indipendenti con media Softmax.\"\"\"
-    def __init__(self, models):
-        super().__init__()
-        self.models = nn.ModuleList(models)
-
-    def forward(self, x):
-        logits_list = [m(x) for m in self.models]
-        return torch.stack(logits_list, dim=0).mean(dim=0)
-
-    def predict_probabilities(self, x):
-        self.eval()
-        with torch.no_grad():
-            probs_list = [m.predict_probabilities(x) for m in self.models]
-            return torch.stack(probs_list, dim=0).mean(dim=0)
-
-    def save(self, filepath):
-        state = {
-            "type": "ensemble_tcn",
-            "num_models": len(self.models),
-            "state_dicts": [m.state_dict() for m in self.models]
-        }
-        torch.save(state, filepath)
 """)
 
-# Cell 8: Split & Training Utility
-add_code("""# 7. Funzioni di Training, Validazione e Split
-def prepare_splits(df_labeled):
-    n = len(df_labeled)
-    embargo = BASE_CONFIG["embargo_bars"]
-    train_end = int(n * 0.70)
-    val_start = train_end + embargo
-    val_end = val_start + int(n * 0.15)
-    test_start = val_end + embargo
+# =====================================================================
+# Cell 8: Split Engine, Trainer & Anti-Chop Backtester
+# =====================================================================
+add_code("""# 7. Split Engine, Training Loop & Simulatore Anti-Chop
 
-    train_df = df_labeled.iloc[:train_end].copy().reset_index(drop=True)
-    val_df = df_labeled.iloc[val_start:val_end].copy().reset_index(drop=True)
-    test_df = df_labeled.iloc[test_start:].copy().reset_index(drop=True)
+def extract_windows_from_segment(features, labels, lookback=64):
+    n = len(features)
+    if n < lookback:
+        return np.empty((0, features.shape[1], lookback), dtype=np.float32), np.empty((0,), dtype=np.int64)
+    X_list, y_list = [], []
+    for i in range(n - lookback + 1):
+        X_list.append(features[i : i + lookback].T)
+        if labels is not None:
+            y_list.append(labels[i + lookback - 1])
+    return np.array(X_list, dtype=np.float32), (np.array(y_list, dtype=np.int64) if labels is not None else None)
 
-    scaler = FeatureScaler().fit(train_df)
-    train_X = scaler.transform(train_df)
-    val_X = scaler.transform(val_df)
-    test_X = scaler.transform(test_df)
+def prepare_period_splits(df_labeled, test_years, lookback=64, embargo=12, val_ratio=0.15, batch_size=64):
+    test_idx = df_labeled.index[df_labeled["timestamp"].dt.year.isin(test_years)].tolist()
+    t_start, t_end = test_idx[0], test_idx[-1]
 
-    lookback = BASE_CONFIG["lookback_window"]
-    bs = BASE_CONFIG["batch_size"]
-    train_loader = DataLoader(TimeSeriesDataset(train_X, train_df["label"].values, lookback), batch_size=bs, shuffle=True)
-    val_loader = DataLoader(TimeSeriesDataset(val_X, val_df["label"].values, lookback), batch_size=bs, shuffle=False)
-    test_loader = DataLoader(TimeSeriesDataset(test_X, test_df["label"].values, lookback), batch_size=bs, shuffle=False)
+    seg_before = (0, max(0, t_start - embargo)) if t_start > embargo else None
+    seg_after = (t_end + embargo + 1, len(df_labeled)) if (t_end + embargo + 1 < len(df_labeled)) else None
 
-    return (train_df, val_df, test_df), (train_loader, val_loader, test_loader), scaler
+    segments = []
+    if seg_before and seg_before[1] > seg_before[0]:
+        segments.append(df_labeled.iloc[seg_before[0]:seg_before[1]])
+    if seg_after and seg_after[1] > seg_after[0]:
+        segments.append(df_labeled.iloc[seg_after[0]:seg_after[1]])
 
-def train_tcn_model(train_loader, val_loader, train_y, lr=3e-4, dropout=0.30, weight_decay=0.01, max_epochs=35, patience=8, seed=42):
+    train_pool_df = pd.concat(segments, axis=0).reset_index(drop=True)
+    scaler = FeatureScaler().fit(train_pool_df)
+
+    total_pool_len = sum(len(s) for s in segments)
+    n_val_target = int(total_pool_len * val_ratio)
+
+    primary_val_seg = segments[-1]
+    val_cutoff = max(lookback + embargo, len(primary_val_seg) - n_val_target)
+
+    train_dfs = segments[:-1] + [primary_val_seg.iloc[:val_cutoff - embargo]]
+    val_dfs = [primary_val_seg.iloc[val_cutoff:]]
+
+    train_X_list, train_y_list = [], []
+    val_X_list, val_y_list = [], []
+
+    for t_df in train_dfs:
+        feat = scaler.transform(t_df)
+        lab = t_df["label"].values
+        X, y = extract_windows_from_segment(feat, lab, lookback)
+        train_X_list.append(X)
+        train_y_list.append(y)
+
+    for v_df in val_dfs:
+        feat = scaler.transform(v_df)
+        lab = v_df["label"].values
+        X, y = extract_windows_from_segment(feat, lab, lookback)
+        val_X_list.append(X)
+        val_y_list.append(y)
+
+    train_X = np.concatenate(train_X_list, axis=0)
+    train_y = np.concatenate(train_y_list, axis=0)
+    val_X = np.concatenate(val_X_list, axis=0)
+    val_y = np.concatenate(val_y_list, axis=0)
+
+    test_slice_start = max(0, t_start - lookback + 1)
+    test_slice_df = df_labeled.iloc[test_slice_start : t_end + 1].copy().reset_index(drop=True)
+    test_feat = scaler.transform(test_slice_df)
+    test_X, test_y = extract_windows_from_segment(test_feat, test_slice_df["label"].values, lookback)
+
+    test_bars = df_labeled.iloc[t_start : t_end + 1].copy().reset_index(drop=True)
+    assert len(test_X) == len(test_bars), f"Test mismatch: {len(test_X)} windows vs {len(test_bars)} barre"
+
+    train_loader = DataLoader(TensorDataset(torch.tensor(train_X), torch.tensor(train_y)), batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(TensorDataset(torch.tensor(val_X), torch.tensor(val_y)), batch_size=batch_size, shuffle=False)
+    test_loader = DataLoader(TensorDataset(torch.tensor(test_X), torch.tensor(test_y)), batch_size=batch_size, shuffle=False)
+
+    return train_loader, val_loader, test_loader, test_bars, scaler, (len(train_X), len(val_X), len(test_X))
+
+def train_tcn_model(train_loader, val_loader, train_y, lr=3e-4, dropout=0.30, weight_decay=0.01, max_epochs=30, patience=8, seed=42):
     set_seed(seed)
     model = TemporalConvolutionalNetwork(
         num_features=len(FEATURE_COLUMNS),
@@ -421,7 +472,7 @@ def train_tcn_model(train_loader, val_loader, train_y, lr=3e-4, dropout=0.30, we
     weights = len(train_y) / (3.0 * np.maximum(class_counts, 1.0))
     criterion = nn.CrossEntropyLoss(weight=torch.tensor(weights, dtype=torch.float32).to(DEVICE))
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=4)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=3)
 
     best_val_loss = float("inf")
     best_weights = None
@@ -440,7 +491,6 @@ def train_tcn_model(train_loader, val_loader, train_y, lr=3e-4, dropout=0.30, we
             optimizer.step()
             tot_loss += loss.item() * len(yb)
 
-        # Valutazione
         model.eval()
         v_loss, preds_all, targets_all = 0.0, [], []
         with torch.no_grad():
@@ -476,23 +526,16 @@ def predict_probabilities(model, loader):
             xb = xb.to(DEVICE)
             all_probs.append(model.predict_probabilities(xb).cpu().numpy())
     return np.concatenate(all_probs, axis=0)
-""")
 
-# Cell 9: Generic Backtest Function
-add_code("""# 8. Simulatore di Backtest Flessibile (Supporta Barriere Fisse, ATR e Trailing Stop)
 def run_simulation(
     test_bars,
     probs,
     prob_threshold=0.38,
     ratio_threshold=1.25,
-    fixed_tp_pct=0.028,
-    fixed_sl_pct=0.018,
-    use_dynamic_atr=False,
+    min_norm_atr=0.0,
     atr_mult_tp=2.2,
     atr_mult_sl=1.4,
-    use_trailing_stop=False,
-    breakeven_trigger_pct=0.012,
-    capital_allocation_pct=0.10,   # 10% capitale per trade (o 25%)
+    capital_allocation_pct=0.10,
     initial_capital=1000.0,
     taker_fee=0.0005,
     max_holding=6
@@ -501,6 +544,7 @@ def run_simulation(
     equity_curve = [capital]
     active_trade = None
     trades = []
+    filtered_signals_count = 0
 
     for t in range(len(test_bars) - 1):
         curr_bar = test_bars.iloc[t]
@@ -513,33 +557,11 @@ def run_simulation(
             entry = active_trade["entry"]
             exit_p, reason = None, None
 
-            # Calcolo dinamico barriere per questa barra
-            if use_dynamic_atr:
-                tp_dist = entry * active_trade["tp_target_pct"]
-                sl_dist = entry * active_trade["sl_target_pct"]
-                curr_tp = entry + tp_dist if active_trade["dir"] == "LONG" else entry - tp_dist
-                curr_sl = entry - sl_dist if active_trade["dir"] == "LONG" else entry + sl_dist
-            else:
-                curr_tp = entry * (1.0 + fixed_tp_pct) if active_trade["dir"] == "LONG" else entry * (1.0 - fixed_tp_pct)
-                curr_sl = entry * (1.0 - fixed_sl_pct) if active_trade["dir"] == "LONG" else entry * (1.0 + fixed_sl_pct)
+            tp_dist = entry * active_trade["tp_target_pct"]
+            sl_dist = entry * active_trade["sl_target_pct"]
+            curr_tp = entry + tp_dist if active_trade["dir"] == "LONG" else entry - tp_dist
+            curr_sl = entry - sl_dist if active_trade["dir"] == "LONG" else entry + sl_dist
 
-            # Logica Trailing Stop a Breakeven
-            if use_trailing_stop:
-                if active_trade["dir"] == "LONG":
-                    # Se il massimo ha superato il trigger breakeven (+1.2%), porta lo SL a Entry + Fee
-                    if h >= entry * (1.0 + breakeven_trigger_pct):
-                        active_trade["be_activated"] = True
-                    if active_trade.get("be_activated", False):
-                        be_price = entry * (1.0 + 2 * taker_fee)
-                        curr_sl = max(curr_sl, be_price)
-                else:
-                    if l <= entry * (1.0 - breakeven_trigger_pct):
-                        active_trade["be_activated"] = True
-                    if active_trade.get("be_activated", False):
-                        be_price = entry * (1.0 - 2 * taker_fee)
-                        curr_sl = min(curr_sl, be_price)
-
-            # Verifica tocchi barriere OCO
             if active_trade["dir"] == "LONG":
                 if h >= curr_tp and l <= curr_sl:
                     exit_p, reason = curr_sl, "SL"
@@ -569,26 +591,35 @@ def run_simulation(
                 })
                 active_trade = None
 
-        # 2. Apertura nuovo trade
+        # 2. Apertura nuovo trade con Filtro Anti-Chop
         if active_trade is None and t < len(probs):
             p_neu, p_l, p_s = probs[t]
+            atr_val = curr_bar["norm_atr"]
+
+            volatility_ok = (atr_val >= min_norm_atr)
+
             signal = None
+            raw_signal = None
             if p_l >= prob_threshold and p_l >= ratio_threshold * p_s:
-                signal = "LONG"
+                raw_signal = "LONG"
             elif p_s >= prob_threshold and p_s >= ratio_threshold * p_l:
-                signal = "SHORT"
+                raw_signal = "SHORT"
+
+            if raw_signal is not None:
+                if volatility_ok:
+                    signal = raw_signal
+                else:
+                    filtered_signals_count += 1
 
             if signal is not None:
                 trade_size = max(50.0, capital * capital_allocation_pct)
-                atr_val = curr_bar["norm_atr"]
                 active_trade = {
                     "dir": signal,
                     "entry": next_bar["open"],
                     "duration": 0,
                     "size": trade_size,
                     "tp_target_pct": max(0.015, atr_val * atr_mult_tp),
-                    "sl_target_pct": max(0.010, atr_val * atr_mult_sl),
-                    "be_activated": False
+                    "sl_target_pct": max(0.010, atr_val * atr_mult_sl)
                 }
 
         equity_curve.append(capital)
@@ -609,198 +640,326 @@ def run_simulation(
         "win_rate_pct": round(win_rate, 1),
         "profit_factor": round(profit_factor, 2),
         "total_trades": len(trades),
-        "equity_curve": equity_curve
+        "filtered_trades": filtered_signals_count,
+        "equity_curve": equity_curve,
+        "trades": trades
     }
-""")
 
-# Cell 10: Experiment 1: Grid Search
-add_code("""# =====================================================================
-# ESPERIMENTO 1: Grid Search su Validation Set (Selezione Iperparametri)
-# =====================================================================
-print("--- AVVIO ESPERIMENTO 1: Tuning Iperparametri su Validation Set ---")
-df_labeled_exp1 = apply_triple_barrier(df_features, tp_pct=0.020, sl_pct=0.014, use_dynamic_atr=False)
-(train_df, val_df, test_df), (train_loader, val_loader, test_loader), scaler_exp1 = prepare_splits(df_labeled_exp1)
-
-grid_configs = [
-    {"name": "C1 (Standard 3e-4, drop=0.30, wd=0.01)", "lr": 3e-4, "dropout": 0.30, "wd": 0.01},
-    {"name": "C2 (High Reg 1.5e-4, drop=0.35, wd=0.02)", "lr": 1.5e-4, "dropout": 0.35, "wd": 0.02},
-    {"name": "C3 (Moderate 5e-4, drop=0.25, wd=0.005)", "lr": 5e-4, "dropout": 0.25, "wd": 0.005}
+# Le 4 Configurazioni di Test
+ANTI_CHOP_CONFIGS = [
+    {
+        "key": "v1_std",
+        "name": "1. Standard (Controllo: 0.38 / 1.25)",
+        "p_thresh": 0.38,
+        "r_thresh": 1.25,
+        "min_atr": 0.0,
+        "color": "#0077b6"
+    },
+    {
+        "key": "v2_conf",
+        "name": "2. Anti-Chop Confidenza (0.42 / 1.30)",
+        "p_thresh": 0.42,
+        "r_thresh": 1.30,
+        "min_atr": 0.0,
+        "color": "#ffaa00"
+    },
+    {
+        "key": "v3_hybrid",
+        "name": "3. Anti-Chop Ibrido (0.42 / 1.30 + ATR>=1.0%)",
+        "p_thresh": 0.42,
+        "r_thresh": 1.30,
+        "min_atr": 0.010,
+        "color": "#00a86b"
+    },
+    {
+        "key": "v4_sniper",
+        "name": "4. Anti-Chop Sniper (0.45 / 1.35 + ATR>=1.1%)",
+        "p_thresh": 0.45,
+        "r_thresh": 1.35,
+        "min_atr": 0.011,
+        "color": "#d90429"
+    }
 ]
 
-best_exp1_model = None
-best_exp1_f1 = -1.0
-best_exp1_cfg = None
+def evaluate_period_antichop(
+    period_name,
+    test_years,
+    df_labeled_atr,
+    lr=3e-4,
+    dropout=0.30,
+    weight_decay=0.01,
+    max_epochs=30,
+    patience=8
+):
+    print("\\n" + "=" * 80)
+    print(f"🚀 AVVIO VALUTAZIONE: {period_name}")
+    print(f"   Anni di Test: {test_years} | Embargo: {BASE_CONFIG['embargo_bars']} barre | Lookback: {BASE_CONFIG['lookback_window']} barre")
+    print("=" * 80)
 
-for cfg in grid_configs:
-    print(f"Training {cfg['name']}...")
-    model, v_loss, v_f1 = train_tcn_model(
-        train_loader, val_loader, train_df["label"].values,
-        lr=cfg["lr"], dropout=cfg["dropout"], weight_decay=cfg["wd"]
+    tr_loader, val_loader, test_loader, test_bars, scaler, counts = prepare_period_splits(
+        df_labeled_atr, test_years,
+        lookback=BASE_CONFIG["lookback_window"],
+        embargo=BASE_CONFIG["embargo_bars"],
+        batch_size=BASE_CONFIG["batch_size"]
     )
-    print(f"  --> Val Loss: {v_loss:.4f} | Val Macro F1: {v_f1:.4f}")
-    if v_f1 > best_exp1_f1:
-        best_exp1_f1 = v_f1
-        best_exp1_model = model
-        best_exp1_cfg = cfg
+    print(f"   Dati: {counts[0]} train windows, {counts[1]} val windows, {counts[2]} test bars")
 
-print(f"\\nConfigurazione Vincitrice Exp 1: {best_exp1_cfg['name']} con Val F1 = {best_exp1_f1:.4f}")
+    train_y = []
+    for _, yb in tr_loader:
+        train_y.extend(yb.numpy())
+    train_y = np.array(train_y)
 
-# Valutazione Backtest su Test Set
-probs_exp1 = predict_probabilities(best_exp1_model, test_loader)
-test_bars = test_df.iloc[BASE_CONFIG["lookback_window"] - 1:].copy().reset_index(drop=True)
-
-res_exp1 = run_simulation(
-    test_bars, probs_exp1,
-    prob_threshold=0.38, ratio_threshold=1.25,
-    fixed_tp_pct=0.028, fixed_sl_pct=0.018,
-    capital_allocation_pct=0.10
-)
-
-print(f"Risultati Test Exp 1 (Baseline Tunata): Return={res_exp1['total_return_pct']}% | WinRate={res_exp1['win_rate_pct']}% | Trades={res_exp1['total_trades']} | DD={res_exp1['max_drawdown_pct']}%")
-""")
-
-# Cell 11: Experiment 2: Dynamic ATR
-add_code("""# =====================================================================
-# ESPERIMENTO 2: Dynamic ATR Volatility Barriers (Target Adattivi)
-# =====================================================================
-print("--- AVVIO ESPERIMENTO 2: Barriere Dinamiche Basate su ATR ---")
-df_labeled_exp2 = apply_triple_barrier(
-    df_features,
-    use_dynamic_atr=True,
-    atr_mult_tp=2.2,
-    atr_mult_sl=1.4
-)
-
-(train_df2, val_df2, test_df2), (train_loader2, val_loader2, test_loader2), scaler_exp2 = prepare_splits(df_labeled_exp2)
-
-# Addestra usando i migliori iperparametri dell'Exp 1
-print(f"Training TCN su label ATR Dinamiche con parametri vincenti ({best_exp1_cfg['name']})...")
-model_exp2, v_loss2, v_f12 = train_tcn_model(
-    train_loader2, val_loader2, train_df2["label"].values,
-    lr=best_exp1_cfg["lr"], dropout=best_exp1_cfg["dropout"], weight_decay=best_exp1_cfg["wd"]
-)
-print(f"Modello Exp 2 completato -> Val Loss: {v_loss2:.4f} | Val Macro F1: {v_f12:.4f}")
-
-probs_exp2 = predict_probabilities(model_exp2, test_loader2)
-test_bars2 = test_df2.iloc[BASE_CONFIG["lookback_window"] - 1:].copy().reset_index(drop=True)
-
-res_exp2 = run_simulation(
-    test_bars2, probs_exp2,
-    prob_threshold=0.38, ratio_threshold=1.25,
-    use_dynamic_atr=True,
-    atr_mult_tp=2.2, atr_mult_sl=1.4,
-    capital_allocation_pct=0.10
-)
-
-print(f"Risultati Test Exp 2 (Dynamic ATR): Return={res_exp2['total_return_pct']}% | WinRate={res_exp2['win_rate_pct']}% | Trades={res_exp2['total_trades']} | DD={res_exp2['max_drawdown_pct']}%")
-""")
-
-# Cell 12: Experiment 3: Deep Ensemble (5 TCN Multi-Seed Bagging)
-add_code("""# =====================================================================
-# ESPERIMENTO 3: Deep Ensemble (5-TCN Multi-Seed Bagging Consensus)
-# =====================================================================
-print("--- AVVIO ESPERIMENTO 3: Deep Ensemble (5 Reti TCN Collaborative) ---")
-ENSEMBLE_SEEDS = [42, 101, 777, 1337, 2024]
-ensemble_models = []
-
-for i, s in enumerate(ENSEMBLE_SEEDS, 1):
-    print(f"Training Membro Ensemble #{i}/{len(ENSEMBLE_SEEDS)} (Seed={s})...")
-    m, v_loss_m, v_f1_m = train_tcn_model(
-        train_loader2, val_loader2, train_df2["label"].values,
-        lr=best_exp1_cfg["lr"],
-        dropout=best_exp1_cfg["dropout"],
-        weight_decay=best_exp1_cfg["wd"],
-        seed=s
+    print("   Addestramento Rete TCN Dynamic ATR...")
+    model, val_loss, val_f1 = train_tcn_model(
+        tr_loader, val_loader, train_y,
+        lr=lr, dropout=dropout, weight_decay=weight_decay,
+        max_epochs=max_epochs, patience=patience, seed=42
     )
-    print(f"  --> Membro #{i} terminato: Val Loss: {v_loss_m:.4f} | Val F1: {v_f1_m:.4f}")
-    ensemble_models.append(m)
+    print(f"   Modello addestrato -> Val Loss: {val_loss:.4f} | Val F1: {val_f1:.4f}")
 
-ensemble = EnsembleTCN(ensemble_models)
-probs_exp3 = predict_probabilities(ensemble, test_loader2)
-test_bars3 = test_bars2
+    print("   Calcolo distribuzioni di probabilità Softmax sul test set...")
+    probs = predict_probabilities(model, test_loader)
 
-res_exp3 = run_simulation(
-    test_bars3, probs_exp3,
-    prob_threshold=0.38, ratio_threshold=1.25,
-    use_dynamic_atr=True,
-    atr_mult_tp=2.2, atr_mult_sl=1.4,
-    capital_allocation_pct=0.10
-)
+    results = {}
+    summary_rows = []
 
-print(f"Risultati Test Exp 3 (5-TCN Ensemble): Return={res_exp3['total_return_pct']}% | WinRate={res_exp3['win_rate_pct']}% | Trades={res_exp3['total_trades']} | DD={res_exp3['max_drawdown_pct']}%")
-""")
+    for cfg in ANTI_CHOP_CONFIGS:
+        res = run_simulation(
+            test_bars, probs,
+            prob_threshold=cfg["p_thresh"],
+            ratio_threshold=cfg["r_thresh"],
+            min_norm_atr=cfg["min_atr"],
+            capital_allocation_pct=0.10
+        )
+        results[cfg["key"]] = res
+        summary_rows.append({
+            "Configurazione": cfg["name"],
+            "Rendimento %": f"{res['total_return_pct']:+.2f}%",
+            "Max Drawdown %": f"{res['max_drawdown_pct']:.2f}%",
+            "Win Rate %": f"{res['win_rate_pct']:.1f}%",
+            "Profit Factor": res["profit_factor"],
+            "Trade Totali": res["total_trades"],
+            "Trade Filtrati": res["filtered_trades"]
+        })
+        print(f"   -> {cfg['name']}: Ret={res['total_return_pct']:+.2f}% | PF={res['profit_factor']:.2f} | WR={res['win_rate_pct']:.1f}% | DD={res['max_drawdown_pct']:.2f}% | Trades={res['total_trades']} (Filtrati: {res['filtered_trades']})")
 
-# Cell 13: Summary Comparison & Export
-add_code("""# =====================================================================
-# 📊 CONFRONTO BENCHMARK MULTI-ESPERIMENTO & EXPORT CHAMPION
-# =====================================================================
-summary_df = pd.DataFrame([
-    {
-        "Esperimento": "1. Baseline Tunata (Fisso 10%)",
-        "Rendimento %": f"{res_exp1['total_return_pct']:+.2f}%",
-        "Max Drawdown %": f"{res_exp1['max_drawdown_pct']:.2f}%",
-        "Win Rate %": f"{res_exp1['win_rate_pct']:.1f}%",
-        "Profit Factor": res_exp1["profit_factor"],
-        "Trade Totali": res_exp1["total_trades"]
-    },
-    {
-        "Esperimento": "2. Dynamic ATR Volatility",
-        "Rendimento %": f"{res_exp2['total_return_pct']:+.2f}%",
-        "Max Drawdown %": f"{res_exp2['max_drawdown_pct']:.2f}%",
-        "Win Rate %": f"{res_exp2['win_rate_pct']:.1f}%",
-        "Profit Factor": res_exp2["profit_factor"],
-        "Trade Totali": res_exp2["total_trades"]
-    },
-    {
-        "Esperimento": "3. 5-TCN Deep Ensemble",
-        "Rendimento %": f"{res_exp3['total_return_pct']:+.2f}%",
-        "Max Drawdown %": f"{res_exp3['max_drawdown_pct']:.2f}%",
-        "Win Rate %": f"{res_exp3['win_rate_pct']:.1f}%",
-        "Profit Factor": res_exp3["profit_factor"],
-        "Trade Totali": res_exp3["total_trades"]
+    df_summary = pd.DataFrame(summary_rows)
+    print(f"\\n--- TABELLA: {period_name} ---")
+    print(df_summary.to_string(index=False))
+    print("=" * 80 + "\\n")
+
+    return {
+        "period_name": period_name,
+        "test_years": test_years,
+        "results": results,
+        "model": model,
+        "scaler": scaler,
+        "test_bars": test_bars
     }
-])
+""")
 
-print("\\n" + "="*80)
-print("TABELLA COMPARATIVA SUL TEST SET OUT-OF-SAMPLE (POST-FEE):")
-print("="*80)
-print(summary_df.to_string(index=False))
-print("="*80 + "\\n")
+# =====================================================================
+# Cell 9: Period 1: 2022 Bear Market
+# =====================================================================
+add_code("""# =====================================================================
+# 📉 PERIODO 1: 2022 BEAR MARKET (Crollo BTC da 48k a 16k)
+# =====================================================================
 
-# Grafico delle Equity Curve a confronto
-plt.figure(figsize=(13, 6))
-plt.plot(res_exp1["equity_curve"], label=f"Exp 1: Baseline Tuned ({res_exp1['total_return_pct']:+.1f}%)", color="#0077b6", lw=1.5)
-plt.plot(res_exp2["equity_curve"], label=f"Exp 2: Dynamic ATR ({res_exp2['total_return_pct']:+.1f}%)", color="#ffaa00", lw=1.5)
-plt.plot(res_exp3["equity_curve"], label=f"Exp 3: 5-TCN Deep Ensemble ({res_exp3['total_return_pct']:+.1f}%)", color="#00a86b", lw=2.2)
-plt.title("TCN Quantitative Trading Bot - Confronto Multi-Esperimento su Test Set (Post-Fee)")
-plt.ylabel("Portfolio Equity ($)")
-plt.xlabel("Barre Temporali (4H)")
-plt.grid(True, alpha=0.3)
-plt.legend(loc="upper left")
+res_period1 = evaluate_period_antichop(
+    period_name="Periodo 1: 2022 (Bear Market)",
+    test_years=[2022],
+    df_labeled_atr=df_labeled_atr,
+    lr=3e-4,
+    dropout=0.30,
+    weight_decay=0.01,
+    max_epochs=BASE_CONFIG["max_epochs"],
+    patience=BASE_CONFIG["patience"]
+)
+""")
+
+# =====================================================================
+# Cell 10: Period 2: 2024 Bull Market
+# =====================================================================
+add_code("""# =====================================================================
+# 📈 PERIODO 2: 2024 BULL MARKET (Rally da 40k a 95k+)
+# =====================================================================
+
+res_period2 = evaluate_period_antichop(
+    period_name="Periodo 2: 2024 (Bull Market)",
+    test_years=[2024],
+    df_labeled_atr=df_labeled_atr,
+    lr=3e-4,
+    dropout=0.30,
+    weight_decay=0.01,
+    max_epochs=BASE_CONFIG["max_epochs"],
+    patience=BASE_CONFIG["patience"]
+)
+""")
+
+# =====================================================================
+# Cell 11: Period 3: 2025-2026 Recent Market
+# =====================================================================
+add_code("""# =====================================================================
+# ⚡ PERIODO 3: 2025-2026 RECENT MARKET (Condizioni Contemporanee)
+# =====================================================================
+
+res_period3 = evaluate_period_antichop(
+    period_name="Periodo 3: 2025-2026 (Recent Market)",
+    test_years=[2025, 2026],
+    df_labeled_atr=df_labeled_atr,
+    lr=3e-4,
+    dropout=0.30,
+    weight_decay=0.01,
+    max_epochs=BASE_CONFIG["max_epochs"],
+    patience=BASE_CONFIG["patience"]
+)
+""")
+
+# =====================================================================
+# Cell 12: Macro Benchmark Cross-Periodi, Grafico Multi-Pannello & Export
+# =====================================================================
+add_code("""# =====================================================================
+# 📊 CONFRONTO BENCHMARK CROSS-PERIODI & EXPORT CHAMPION MODEL
+# =====================================================================
+
+periods_data = [
+    ("2022 (Bear)", res_period1),
+    ("2024 (Bull)", res_period2),
+    ("2025-26 (Recent)", res_period3)
+]
+
+matrix_rows = []
+for cfg in ANTI_CHOP_CONFIGS:
+    k = cfg["key"]
+    name = cfg["name"]
+
+    r1 = res_period1["results"][k]
+    r2 = res_period2["results"][k]
+    r3 = res_period3["results"][k]
+
+    ret1, pf1 = r1["total_return_pct"], r1["profit_factor"]
+    ret2, pf2 = r2["total_return_pct"], r2["profit_factor"]
+    ret3, pf3 = r3["total_return_pct"], r3["profit_factor"]
+
+    avg_ret = np.mean([ret1, ret2, ret3])
+    cum_ret = ((1 + ret1/100) * (1 + ret2/100) * (1 + ret3/100) - 1) * 100
+    worst_dd = max(r1["max_drawdown_pct"], r2["max_drawdown_pct"], r3["max_drawdown_pct"])
+    avg_wr = np.mean([r1["win_rate_pct"], r2["win_rate_pct"], r3["win_rate_pct"]])
+    avg_pf = np.mean([pf1, pf2, pf3])
+    total_trades = r1["total_trades"] + r2["total_trades"] + r3["total_trades"]
+
+    matrix_rows.append({
+        "Configurazione": name,
+        "2022 Bear (Ret / PF)": f"{ret1:+.2f}% / {pf1:.2f}",
+        "2024 Bull (Ret / PF)": f"{ret2:+.2f}% / {pf2:.2f}",
+        "2025-26 Recente (Ret / PF)": f"{ret3:+.2f}% / {pf3:.2f}",
+        "Rendimento Medio %": f"{avg_ret:+.2f}%",
+        "Rendimento Cumulato %": f"{cum_ret:+.2f}%",
+        "Max DD Peggiore %": f"{worst_dd:.2f}%",
+        "Win Rate Medio %": f"{avg_wr:.1f}%",
+        "Profit Factor Medio": f"{avg_pf:.2f}",
+        "Trade Totali": total_trades
+    })
+
+matrix_df = pd.DataFrame(matrix_rows)
+
+print("\\n" + "=" * 100)
+print("🏆 SUPER-TABELLA COMPARATIVA CROSS-PERIODO")
+print("=" * 100)
+print(matrix_df.to_string(index=False))
+print("=" * 100 + "\\n")
+
+# Grafico Multi-Pannello a 4 riquadri (2x2)
+fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+
+# Subplot 1: 2022 Bear Market
+ax1 = axes[0, 0]
+for cfg in ANTI_CHOP_CONFIGS:
+    k = cfg["key"]
+    res = res_period1["results"][k]
+    ax1.plot(res["equity_curve"], label=f"{cfg['name']} ({res['total_return_pct']:+.1f}%)", color=cfg["color"], lw=1.8)
+ax1.set_title("Periodo 1: 2022 (Bear Market - Crollo -65%)", fontweight="bold")
+ax1.set_ylabel("Equity ($)")
+ax1.set_xlabel("Barre 4H")
+ax1.grid(True, alpha=0.3)
+ax1.legend(loc="upper left")
+
+# Subplot 2: 2024 Bull Market
+ax2 = axes[0, 1]
+for cfg in ANTI_CHOP_CONFIGS:
+    k = cfg["key"]
+    res = res_period2["results"][k]
+    ax2.plot(res["equity_curve"], label=f"{cfg['name']} ({res['total_return_pct']:+.1f}%)", color=cfg["color"], lw=1.8)
+ax2.set_title("Periodo 2: 2024 (Bull Market - Rally +140%)", fontweight="bold")
+ax2.set_ylabel("Equity ($)")
+ax2.set_xlabel("Barre 4H")
+ax2.grid(True, alpha=0.3)
+ax2.legend(loc="upper left")
+
+# Subplot 3: 2025-2026 Recent Market
+ax3 = axes[1, 0]
+for cfg in ANTI_CHOP_CONFIGS:
+    k = cfg["key"]
+    res = res_period3["results"][k]
+    ax3.plot(res["equity_curve"], label=f"{cfg['name']} ({res['total_return_pct']:+.1f}%)", color=cfg["color"], lw=1.8)
+ax3.set_title("Periodo 3: 2025-2026 (Recent Market)", fontweight="bold")
+ax3.set_ylabel("Equity ($)")
+ax3.set_xlabel("Barre 4H")
+ax3.grid(True, alpha=0.3)
+ax3.legend(loc="upper left")
+
+# Subplot 4: Bar Chart Comparativo Rendimenti
+ax4 = axes[1, 1]
+x_indices = np.arange(len(periods_data))
+bar_width = 0.20
+
+for i, cfg in enumerate(ANTI_CHOP_CONFIGS):
+    k = cfg["key"]
+    returns = [p_res["results"][k]["total_return_pct"] for _, p_res in periods_data]
+    ax4.bar(x_indices + (i - 1.5) * bar_width, returns, width=bar_width, label=cfg["name"], color=cfg["color"], alpha=0.9)
+
+ax4.axhline(0, color="black", linestyle="--", lw=1)
+ax4.set_xticks(x_indices)
+ax4.set_xticklabels([p_label for p_label, _ in periods_data], fontweight="bold")
+ax4.set_ylabel("Rendimento Netto % (Post-Fee)")
+ax4.set_title("Confronto Rendimenti nei 3 Regimi", fontweight="bold")
+ax4.grid(True, alpha=0.3, axis="y")
+ax4.legend(loc="best")
+
 plt.tight_layout()
-chart_path = "/kaggle/working/comparison_equity_curves.png" if os.path.exists("/kaggle/working") else "models/comparison_equity_curves.png"
+chart_path = "/kaggle/working/antichop_comparison.png" if os.path.exists("/kaggle/working") else "models/antichop_comparison.png"
+os.makedirs(os.path.dirname(chart_path), exist_ok=True)
 plt.savefig(chart_path, dpi=200)
 plt.show()
 
-# Salvataggio Pesi e Scaler
-ensemble_save_path = "/kaggle/working/tcn_ensemble.pth" if os.path.exists("/kaggle/working") else "models/tcn_ensemble.pth"
+# =====================================================================
+# Salvataggio Modello Campione e Scaler per Live Agent
+# =====================================================================
 single_save_path = "/kaggle/working/tcn_best_model.pth" if os.path.exists("/kaggle/working") else "models/tcn_best_model.pth"
 scaler_save_path = "/kaggle/working/scaler.pkl" if os.path.exists("/kaggle/working") else "models/scaler.pkl"
 
-ensemble.save(ensemble_save_path)
-torch.save(model_exp2.state_dict(), single_save_path)
+torch.save(res_period3["model"].state_dict(), single_save_path)
 with open(scaler_save_path, "wb") as f:
-    pickle.dump(scaler_exp2, f)
+    pickle.dump(res_period3["scaler"], f)
 
-print(f"Ensemble (5 modelli) salvato in: {ensemble_save_path}")
-print(f"Modello Singolo salvato in:     {single_save_path}")
-print(f"Scaler Campione salvato in:     {scaler_save_path}")
-print(f"Grafico comparativo salvato:    {chart_path}")
-print("\\nEntrambi i modelli sono compatibili al 100% con il live agent!")
+print(f"✅ Modello TCN Champion salvato in:  {single_save_path}")
+print(f"✅ Scaler Campione salvato in:      {scaler_save_path}")
+print(f"✅ Grafico Comparativo salvato:     {chart_path}")
+
+best_row = max(matrix_rows, key=lambda r: float(r['Rendimento Cumulato %'].replace('%', '').replace('+', '')))
+print(f\"\"\"
+--------------------------------------------------------------------------------
+🏆 CONFIGURAZIONE CAMPIONE: {best_row['Configurazione']}
+   - Rendimento Cumulato: {best_row['Rendimento Cumulato %']}
+   - Profit Factor Medio: {best_row['Profit Factor Medio']}
+   - Max Drawdown:        {best_row['Max DD Peggiore %']}
+--------------------------------------------------------------------------------
+\"\"\")
 """)
 
+# Scrittura del notebook finale
 os.makedirs("notebooks", exist_ok=True)
 with open("notebooks/kaggle_train.ipynb", "w", encoding="utf-8") as f:
     json.dump(notebook, f, indent=2)
 
-print("Notebook multi-esperimento generato con successo in notebooks/kaggle_train.ipynb!")
+print("Notebook ripristinato con successo alla versione stabile in notebooks/kaggle_train.ipynb!")
